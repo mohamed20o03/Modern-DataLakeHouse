@@ -33,7 +33,9 @@ build/
 ### VS Code ###
 .vscode/
 
+# Hide all .metals files
+.metals/
+
 # Exclude large files exceeding GitHub's size limit
-.metals/metals.mv.db
 query-worker/target/query-worker-1.0.0.jar
 ingestion-worker/target/ingestion-worker-1.0.0.jar
