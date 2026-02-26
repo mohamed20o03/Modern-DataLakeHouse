@@ -1,0 +1,258 @@
+services:
+  # ============ Infrastructure ============
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "${MINIO_PORT_API}:9000"
+      - "${MINIO_PORT_CONSOLE}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET_UPLOADS=${MINIO_BUCKET_UPLOADS}
+      - MINIO_BUCKET_WAREHOUSE=${MINIO_BUCKET_WAREHOUSE}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio $${MINIO_ENDPOINT} $${MINIO_ACCESS_KEY} $${MINIO_SECRET_KEY};
+      mc mb myminio/$${MINIO_BUCKET_UPLOADS} --ignore-existing;
+      mc mb myminio/$${MINIO_BUCKET_WAREHOUSE} --ignore-existing;
+      exit 0;
+      "
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "${RABBITMQ_PORT}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 10s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "${REDIS_PORT_EXTERNAL}:6379"
+    volumes:
+      - redis_data:/data
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ============ API Service ============
+  api-service:
+    build: ./api-service
+    image: data-lakehouse-api:latest
+    container_name: api-service
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${API_SERVICE_PORT}:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET_UPLOADS=${MINIO_BUCKET_UPLOADS}
+      - MINIO_BUCKET_WAREHOUSE=${MINIO_BUCKET_WAREHOUSE}
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USER=${RABBITMQ_DEFAULT_USER}
+      - RABBITMQ_PASS=${RABBITMQ_DEFAULT_PASS}
+      - RABBITMQ_QUEUE_NAME=${RABBITMQ_QUEUE_NAME}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ============ Catalog Database ============
+  catalog-postgres:
+    image: postgres:15-alpine
+    container_name: catalog-postgres
+    ports:
+      - "${POSTGRES_PORT_EXTERNAL}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - catalog_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ============ Iceberg REST Catalog (SHARED) ============
+  iceberg-rest-catalog:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest-catalog
+    ports:
+      - "${ICEBERG_REST_PORT}:8181"
+    environment:
+      # S3/MinIO Configuration
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - AWS_REGION=${AWS_REGION}
+      # Warehouse and IO Configuration
+      - CATALOG_WAREHOUSE=${ICEBERG_WAREHOUSE}
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=${MINIO_ENDPOINT}
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      # PostgreSQL JDBC Backend
+      - CATALOG_CATALOG__IMPL=org.apache.iceberg.jdbc.JdbcCatalog
+      - CATALOG_URI=jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
+      - CATALOG_JDBC_USER=${POSTGRES_USER}
+      - CATALOG_JDBC_PASSWORD=${POSTGRES_PASSWORD}
+    depends_on:
+      catalog-postgres:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8181 && printf \"GET /v1/config HTTP/1.0\\r\\n\\r\\n\" >&3 && cat <&3 | grep -q defaults'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ============ Workers (each uses Iceberg) ============
+  ingestion-worker:
+    build: ./ingestion-worker
+    container_name: ingestion-worker
+    restart: unless-stopped
+    environment:
+      # RabbitMQ Configuration
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USERNAME=${RABBITMQ_DEFAULT_USER}
+      - RABBITMQ_PASSWORD=${RABBITMQ_DEFAULT_PASS}
+      # Redis Configuration
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_MODE=${WORKER_REDIS_MODE}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET_UPLOADS=${MINIO_BUCKET_UPLOADS}
+      - MINIO_BUCKET_WAREHOUSE=${MINIO_BUCKET_WAREHOUSE}
+      # Iceberg Configuration
+      - ICEBERG_CATALOG_URI=${ICEBERG_CATALOG_URI}
+      - ICEBERG_WAREHOUSE=${ICEBERG_WAREHOUSE}
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - AWS_REGION=${AWS_REGION}
+      # Worker Configuration
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY}
+      - INGESTION_ENGINE=${INGESTION_ENGINE}
+      - CONSUMER_TYPE=${CONSUMER_TYPE}
+      - STORAGE_TYPE=${STORAGE_TYPE}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      iceberg-rest-catalog:
+        condition: service_healthy
+    # Note: Health check depends on worker implementation
+    # Uncomment when worker has health endpoint
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+    #   interval: 15s
+    #   timeout: 5s
+    #   retries: 3
+    #   start_period: 30s
+    # Scale workers: docker compose up -d --scale ingestion-worker=3
+
+  # ============ Query Worker ============
+  query-worker:
+    build: ./query-worker
+    container_name: query-worker
+    restart: unless-stopped
+    environment:
+      # RabbitMQ Configuration
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USERNAME=${RABBITMQ_DEFAULT_USER}
+      - RABBITMQ_PASSWORD=${RABBITMQ_DEFAULT_PASS}
+      # Redis Configuration
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_MODE=${WORKER_REDIS_MODE}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+      - MINIO_BUCKET_UPLOADS=${MINIO_BUCKET_UPLOADS}
+      - MINIO_BUCKET_WAREHOUSE=${MINIO_BUCKET_WAREHOUSE}
+      # Iceberg Configuration
+      - ICEBERG_CATALOG_URI=${ICEBERG_CATALOG_URI}
+      - ICEBERG_WAREHOUSE=${ICEBERG_WAREHOUSE}
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - AWS_REGION=${AWS_REGION}
+      # Worker Configuration
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY}
+      - QUERY_ENGINE=${QUERY_ENGINE}
+      - CONSUMER_TYPE=${CONSUMER_TYPE}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      iceberg-rest-catalog:
+        condition: service_healthy
+
+volumes:
+  minio_data:
+  rabbitmq_data:
+  redis_data:
+  catalog_db:
