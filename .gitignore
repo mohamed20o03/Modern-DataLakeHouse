@@ -2,8 +2,6 @@
 HELP.md
 target/
 .mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
 
 ### STS ###
 .apt_generated
@@ -33,9 +31,22 @@ build/
 ### VS Code ###
 .vscode/
 
-# Hide all .metals files
+### Metals IDE ###
 .metals/
+.bloop/
+.bloopgun-bsp
+
+### Build & Dependencies ###
+.m2/
+*.class
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
 
 # Exclude large files exceeding GitHub's size limit
-query-worker/target/query-worker-1.0.0.jar
-ingestion-worker/target/ingestion-worker-1.0.0.jar
+*.mv.db
+query-worker/target/
+ingestion-worker/target/
+api-service/target/
