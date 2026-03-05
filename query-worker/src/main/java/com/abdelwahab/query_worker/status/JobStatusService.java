@@ -43,21 +43,23 @@ public interface JobStatusService {
      *
      * <p>Stores all result fields ({@code status}, {@code message},
      * {@code resultPath}, {@code rowCount}, {@code fileSizeBytes},
-     * {@code resultData}, {@code updatedAt}) in a single Redis HSET pipeline
-     * so the API service always reads a consistent snapshot.
+     * {@code resultData}, {@code streamed}, {@code updatedAt}) in a single
+     * Redis HSET pipeline so the API service always reads a consistent snapshot.
      *
      * @param jobId          unique job identifier
      * @param status         lifecycle state ({@code COMPLETED} or {@code FAILED})
      * @param message        human-readable completion message
-     * @param resultPath     MinIO-relative path to the Parquet file; may be {@code null} for schema jobs
+     * @param resultPath     MinIO-relative path to the Parquet file; may be {@code null}
      * @param rowCount       total rows in the result
      * @param fileSizeBytes  size of the Parquet file in bytes
      * @param resultDataJson inline result rows serialised as a JSON array string
+     * @param streamed       whether the result was delivered via Redis Streams
      * @return future that completes when all fields are persisted
      */
     CompletableFuture<Void> writeResult(String jobId, String status, String message,
                                         String resultPath, long rowCount,
-                                        long fileSizeBytes, String resultDataJson);
+                                        long fileSizeBytes, String resultDataJson,
+                                        boolean streamed);
 
     /**
      * Closes the underlying connection / thread pool.

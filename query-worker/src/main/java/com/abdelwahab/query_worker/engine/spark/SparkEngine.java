@@ -9,6 +9,7 @@ import com.abdelwahab.query_worker.engine.QueryEngine;
 import com.abdelwahab.query_worker.engine.QueryService;
 import com.abdelwahab.query_worker.status.JobStatusService;
 import com.abdelwahab.query_worker.storage.StorageConfig;
+import com.abdelwahab.query_worker.streaming.ResultStreamPublisher;
 
 /**
  * Apache Spark implementation of {@link QueryEngine}.
@@ -54,7 +55,7 @@ public class SparkEngine implements QueryEngine {
 
     @Override
     public QueryService initialize(JobStatusService jobStatusService, StorageConfig storageConfig,
-                                   SchemaCacheService schemaCache) {
+                                   SchemaCacheService schemaCache, ResultStreamPublisher streamPublisher) {
         log.info("Initializing SparkEngine — catalog={}, warehouse={}",
                 icebergCatalogUri, icebergWarehouse);
         
@@ -87,7 +88,7 @@ public class SparkEngine implements QueryEngine {
 
         log.info("SparkSession started successfully");
         warmUp();
-        return new SparkService(spark, jobStatusService, storageConfig, schemaCache);
+        return new SparkService(spark, jobStatusService, storageConfig, schemaCache, streamPublisher);
     }
 
     /**

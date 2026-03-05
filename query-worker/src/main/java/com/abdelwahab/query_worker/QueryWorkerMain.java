@@ -14,6 +14,8 @@ import com.abdelwahab.query_worker.status.JobStatusService;
 import com.abdelwahab.query_worker.status.JobStatusServiceFactory;
 import com.abdelwahab.query_worker.storage.StorageConfig;
 import com.abdelwahab.query_worker.storage.StorageConfigFactory;
+import com.abdelwahab.query_worker.streaming.ResultStreamPublisher;
+import com.abdelwahab.query_worker.streaming.ResultStreamPublisherFactory;
 
 public class QueryWorkerMain {
 
@@ -46,6 +48,7 @@ public class QueryWorkerMain {
 		QueryEngine      engine           = null;
 		JobStatusService jobStatusService = null;
 		SchemaCacheService schemaCache    = null;
+		ResultStreamPublisher streamPublisher = null;
 		MessageConsumer  consumer         = null;
 
 		try {
@@ -57,10 +60,12 @@ public class QueryWorkerMain {
 
 			schemaCache = new RedisSchemaCacheService(redisHost, redisPort, redisPassword);
 
+			streamPublisher = ResultStreamPublisherFactory.create(redisHost, redisPort, redisPassword);
+
 			engine = QueryEngineFactory.create(icebergCatalogUri, icebergWarehouse);
 
 			log.info("Initializing query engine...");
-			QueryService queryService = engine.initialize(jobStatusService, storageConfig, schemaCache);
+			QueryService queryService = engine.initialize(jobStatusService, storageConfig, schemaCache, streamPublisher);
 
 			consumer = MessageConsumerFactory.create(
 					rabbitmqHost, rabbitmqPort, rabbitmqUsername, rabbitmqPassword,
@@ -71,6 +76,7 @@ public class QueryWorkerMain {
 			final QueryEngine      engineRef    = engine;
 			final JobStatusService statusRef    = jobStatusService;
 			final SchemaCacheService cacheRef   = schemaCache;
+			final ResultStreamPublisher streamRef = streamPublisher;
 			final MessageConsumer  consumerRef  = consumer;
 
 			Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -79,6 +85,7 @@ public class QueryWorkerMain {
 				try { engineRef.close();   } catch (Exception e) { log.warn("Error closing engine", e); }
 				try { statusRef.close();   } catch (Exception e) { log.warn("Error closing status service", e); }
 				try { cacheRef.close();    } catch (Exception e) { log.warn("Error closing schema cache", e); }
+				try { streamRef.close();   } catch (Exception e) { log.warn("Error closing stream publisher", e); }
 				log.info("Query Worker stopped cleanly.");
 			}, "shutdown-hook"));
 			// ─────────────────────────────────────────────────────────────────

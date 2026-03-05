@@ -83,11 +83,4 @@ public class QueryController {
         return deferred;
     }
 
-    @GetMapping("/tables")
-    public ResponseEntity<Map<String, String>> listTables() {
-        return ResponseEntity.ok(Map.of(
-                "message", "Table listing not yet implemented",
-                "suggestion", "Use source format: {projectId}.{tableName}"
-        ));
-    }
 }

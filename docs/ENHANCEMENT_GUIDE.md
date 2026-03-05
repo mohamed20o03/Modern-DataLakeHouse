@@ -1,18 +1,27 @@
 # Enhancement Guide: Production-Ready Features
 
-A conceptual guide to implementing 3 critical features for production-scale data platforms.
+A conceptual guide to implementing critical features for production-scale data platforms.
+
+> **Implementation status:**
+>
+> - **Streaming / SSE** — ✅ Implemented
+> - **Partitioning** — not yet implemented (conceptual design below)
+> - **File Compaction** — not yet implemented (conceptual design below)
+> - **Query Optimizer** — not yet implemented (conceptual design below)
 
 ---
 
 ## Table of Contents
 
-1. [Partitioning Strategy](#partitioning-strategy)
-2. [File Compaction](#file-compaction)
-3. [Pagination & Streaming](#pagination--streaming)
+1. [Partitioning Strategy](#partitioning-strategy) — not yet implemented
+2. [File Compaction](#file-compaction) — not yet implemented
+3. [Pagination & Streaming](#pagination--streaming) — ✅ implemented
 
 ---
 
 ## Partitioning Strategy
+
+> **Status:** Not yet implemented. The design below describes the intended approach.
 
 ### The Problem
 
@@ -233,6 +242,8 @@ After:  Read 30 × 128 MB = 3.8 GB  → 2 seconds (manifest prunes 970 partition
 
 ## File Compaction
 
+> **Status:** Not yet implemented. The design below describes the intended approach.
+
 ### The Problem
 
 **Current behavior:** Every ingestion creates a new Parquet file.
@@ -395,6 +406,17 @@ After compaction:
 
 ## Pagination & Streaming
 
+> **Status: ✅ Implemented.** SSE-based streaming is fully working. The system streams query results progressively via Server-Sent Events. See the [API Reference](API_REFERENCE.md#7-how-the-sse-stream-works) for frontend usage.
+>
+> **What was built:**
+>
+> - `api-service/.../module/query/streaming/QueryStreamController.java` — SSE endpoint at `/api/v1/query/{jobId}/stream`
+> - `api-service/.../module/query/streaming/QueryStreamService.java` — reads Redis Streams, pushes via `SseEmitter`, with inline fallback
+> - `query-worker/.../streaming/redis/RedisResultStreamPublisher.java` — publishes result batches (500 rows each) to Redis Streams
+> - `query-worker/.../engine/spark/QueryResultWriter.java` — inline threshold (≤ 1 000 rows) vs Redis Stream decision
+>
+> The pagination alternative described below was **not** implemented — streaming was chosen instead.
+
 ### The Problem
 
 **Current behavior:** Large query results are buffered completely before sending to client
@@ -554,115 +576,62 @@ id,product,price
 
 ## Implementation Roadmap
 
-### Phase 1: Partitioning (1-2 weeks)
+### Phase 1: Partitioning (1-2 weeks) — not yet started
 
-1. ✅ Add partition column detection
-2. ✅ Update SparkEngine to create partitioned tables
-3. ✅ Test with date-based partitions
-4. ✅ Measure query speedup
+1. Add partition column detection
+2. Update SparkEngine to create partitioned tables
+3. Test with date-based partitions
+4. Measure query speedup
 
-### Phase 2: Compaction (1 week)
+### Phase 2: Compaction (1 week) — not yet started
 
-1. ✅ Implement CompactionService
-2. ✅ Add heuristic-based compaction
-3. ✅ Integrate into ingestion flow
-4. ✅ Test file count reduction
+1. Implement CompactionService
+2. Add heuristic-based compaction
+3. Integrate into ingestion flow
+4. Test file count reduction
 
-### Phase 3: Query Optimization (2 weeks)
+### Phase 3: Query Optimization (2 weeks) — not yet started
 
-1. ✅ Implement QueryOptimizer
-2. ✅ Add REST endpoints for EXPLAIN/ANALYZE
-3. ✅ Test with various query patterns
-4. ✅ Document performance insights
+1. Implement QueryOptimizer
+2. Add REST endpoints for EXPLAIN/ANALYZE
+3. Test with various query patterns
+4. Document performance insights
 
-### Phase 4: Streaming/Pagination (2 weeks)
+### Phase 4: Streaming ✅ Done
 
-1. ✅ Implement QueryStreamController
-2. ✅ Test JSONL, CSV, Parquet streaming
-3. ✅ Test with large result sets
-4. ✅ Measure memory and latency improvements
+1. ✅ Implement QueryStreamController (SSE endpoint)
+2. ✅ Implement Redis Streams result publishing from query worker
+3. ✅ Handle both inline (≤ 1 000 rows) and streamed (> 1 000 rows) results
+4. ✅ Test with large result sets via `test_system.sh`
 
 ---
 
-## Testing Strategy
+## Testing
 
-### Unit Tests
-
-```java
-@Test
-public void testPartitionColumnDetection() {
-    // Test that date columns are detected correctly
-    Dataset<Row> data = spark.createDataFrame(...);
-    String partCol = sparkEngine.getPartitionColumn(data);
-    assertEquals("event_date", partCol);
-}
-
-@Test
-public void testCompactionHeuristic() {
-    // Test that compaction is triggered when file count exceeds threshold
-    boolean shouldCompact = compactionService.needsCompaction("iceberg.test.table");
-    assertTrue(shouldCompact);
-}
-
-@Test
-public void testStreamingEndpoint() {
-    // Test streaming response contains correct JSONL lines
-    // ...
-}
-```
-
-### Integration Tests
+Integration testing via the existing end-to-end test suite:
 
 ```bash
-# End-to-end test with partitioning
-bash test_system.sh  # Existing test suite
-
-# New tests for partitioning
-# New tests for compaction
-# New tests for streaming
+bash test_system.sh
 ```
 
----
+This exercises ingestion, schema retrieval, queries, and SSE streaming. When partitioning and compaction are implemented, add targeted tests for:
 
-## Monitoring & Metrics
+- Partition column detection (date → month transform, categorical fallback)
+- Compaction triggering and file count reduction
+- Query plan output for EXPLAIN/ANALYZE endpoints
 
-Add Prometheus metrics:
-
-```java
-@Component
-@Slf4j
-public class QueryMetrics {
-
-    private final MeterRegistry meterRegistry;
-
-    public void recordPartitionPruning(int partitionsTotal, int partitionsScanned) {
-        double reductionPercent = 100.0 * (1.0 - (double) partitionsScanned / partitionsTotal);
-        meterRegistry.gauge("query.partition_reduction_percent", reductionPercent);
-    }
-
-    public void recordCompactionTime(long elapsedMs, String table) {
-        meterRegistry.timer("compaction_duration_ms", "table", table).record(elapsedMs, TimeUnit.MILLISECONDS);
-    }
-
-    public void recordStreamingResultSize(long rowCount) {
-        meterRegistry.counter("streaming.row_count").increment(rowCount);
-    }
-}
 ```
 
 ---
 
 ## Summary
 
-These 4 enhancements transform your project from **student prototype** to **production-ready**:
+| Enhancement        | Effort    | Impact                   | Status              |
+| ------------------ | --------- | ------------------------ | ------------------- |
+| Partitioning       | 1-2 weeks | 10-100× query speedup    | Not yet implemented |
+| Compaction         | 1 week    | 4-10× query speedup      | Not yet implemented |
+| Query Optimization | 2 weeks   | visibility + 20% speedup | Not yet implemented |
+| Streaming          | 2 weeks   | 100× memory reduction    | ✅ **Done**          |
 
-| Enhancement        | Effort    | Impact                   | Priority     |
-| ------------------ | --------- | ------------------------ | ------------ |
-| Partitioning       | 1-2 weeks | 10-100× query speedup    | **CRITICAL** |
-| Compaction         | 1 week    | 4-10× query speedup      | **HIGH**     |
-| Query Optimization | 2 weeks   | visibility + 20% speedup | **MEDIUM**   |
-| Streaming          | 2 weeks   | 100× memory reduction    | **HIGH**     |
-
-**Total effort:** 6-7 weeks for a team of 1-2 engineers.
-
-**Result:** Production-grade data platform handling TB-scale datasets efficiently.
+**Remaining effort:** ~4–5 weeks for partitioning, compaction, and query optimization.
+```

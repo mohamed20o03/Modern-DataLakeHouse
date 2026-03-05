@@ -34,4 +34,11 @@ public class QueryResponse {
      * URL to check status
      */
     private String checkStatusAt;
+
+    /**
+     * URL to stream results via SSE.
+     * For large results, clients should connect here to receive
+     * progressive row batches instead of waiting for the full result.
+     */
+    private String streamUrl;
 }

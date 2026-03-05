@@ -3,6 +3,7 @@ package com.abdelwahab.query_worker.engine;
 import com.abdelwahab.query_worker.cache.SchemaCacheService;
 import com.abdelwahab.query_worker.status.JobStatusService;
 import com.abdelwahab.query_worker.storage.StorageConfig;
+import com.abdelwahab.query_worker.streaming.ResultStreamPublisher;
 
 /**
  * Contract for creating and managing a query execution engine.
@@ -26,10 +27,11 @@ public interface QueryEngine {
      * @param jobStatusService for reporting job progress to Redis
      * @param storageConfig    storage credentials and configuration
      * @param schemaCache      cache for Iceberg table schemas
+     * @param streamPublisher  publishes large result batches via Redis Streams
      * @return a ready-to-use QueryService instance
      */
     QueryService initialize(JobStatusService jobStatusService, StorageConfig storageConfig,
-                            SchemaCacheService schemaCache);
+                            SchemaCacheService schemaCache, ResultStreamPublisher streamPublisher);
 
     /**
      * Closes the engine and releases all resources.

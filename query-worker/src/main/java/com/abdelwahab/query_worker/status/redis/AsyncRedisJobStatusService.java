@@ -141,7 +141,8 @@ public class AsyncRedisJobStatusService implements JobStatusService {
     @Override
     public CompletableFuture<Void> writeResult(String jobId, String status, String message,
                                                String resultPath, long rowCount,
-                                               long fileSizeBytes, String resultDataJson) {
+                                               long fileSizeBytes, String resultDataJson,
+                                               boolean streamed) {
         try {
             String key       = JOB_PREFIX + jobId;
             String timestamp = Instant.now().toString();
@@ -153,6 +154,7 @@ public class AsyncRedisJobStatusService implements JobStatusService {
             writes.add(asyncCommands.hset(key, "updatedAt",     timestamp)                       .toCompletableFuture());
             writes.add(asyncCommands.hset(key, "rowCount",      String.valueOf(rowCount))         .toCompletableFuture());
             writes.add(asyncCommands.hset(key, "fileSizeBytes", String.valueOf(fileSizeBytes))    .toCompletableFuture());
+            writes.add(asyncCommands.hset(key, "streamed",      String.valueOf(streamed))         .toCompletableFuture());
 
             // Only write optional fields when present (null = schema job or failure)
             if (resultPath != null) {

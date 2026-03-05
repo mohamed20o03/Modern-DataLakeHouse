@@ -1,162 +1,170 @@
 package com.abdelwahab.query_worker.engine.spark;
 
 import com.abdelwahab.query_worker.dto.query.QueryResult;
-import com.abdelwahab.query_worker.storage.StorageConfig;
-import org.apache.hadoop.fs.ContentSummary;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
+import com.abdelwahab.query_worker.streaming.ResultStreamPublisher;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SaveMode;
-import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
- * Writes a query-result {@link Dataset} to MinIO as a Parquet file, or returns
- * the rows inline when the result set is small enough to skip the MinIO write.
+ * Writes query results using one of two strategies based on result size:
  *
- * <p><b>Responsibility (SRP):</b> only handles result persistence.
- * Query building and status updates live elsewhere.
- *
- * <p><b>Inline vs external strategy:</b>
+ * <p><b>Inline vs streaming strategy:</b>
  * <ul>
  *   <li>{@code rowCount <= INLINE_THRESHOLD} → rows embedded in Redis directly;
- *       no Parquet file written, {@code resultPath} is {@code null}.</li>
- *   <li>{@code rowCount > INLINE_THRESHOLD} → Parquet written to MinIO at
- *       {@code wh/{projectId}/queries/query_{timestamp}/result.parquet}.</li>
+ *       no streaming, fast path for small queries.</li>
+ *   <li>{@code rowCount > INLINE_THRESHOLD} → rows streamed in batches via
+ *       {@link ResultStreamPublisher} (Redis Streams), enabling the API service
+ *       to forward chunks progressively to the client via SSE.</li>
  * </ul>
  *
- * <p><b>Caching strategy:</b> the Dataset is cached before any action so that
- * the inline-row collection and (when needed) the Parquet write share the same
- * computed partitions instead of triggering two independent Spark jobs.
+ * <p><b>Memory efficiency:</b> for large results, the writer uses Spark's
+ * {@link Dataset#toLocalIterator()} to pull rows partition-by-partition rather
+ * than collecting the entire result set into the driver's heap.  A small buffer
+ * (up to {@value #INLINE_THRESHOLD} + 1 rows) is used to decide the strategy
+ * in a single Spark job — no recomputation needed.
  *
- * @see SparkService — the orchestrator that calls this writer
+ * <p><b>Responsibility (SRP):</b> only handles result delivery.
+ * Query building and status updates live elsewhere.
+ *
+ * @see SparkService             — the orchestrator that calls this writer
+ * @see ResultStreamPublisher    — the streaming backend (Redis Streams)
  */
 public class QueryResultWriter {
 
     private static final Logger log = LoggerFactory.getLogger(QueryResultWriter.class);
 
-    private static final DateTimeFormatter TIMESTAMP_FMT =
-            DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
-
     /**
      * Row-count threshold below which results are returned inline (embedded in
-     * Redis) and the MinIO Parquet write is skipped entirely.
-     * Saves ~500 ms of Parquet serialisation + S3 PUT overhead per small query.
+     * Redis) and streaming is skipped entirely.
      */
     private static final int INLINE_THRESHOLD = 1_000;
 
-    private final SparkSession spark;
-    private final StorageConfig storageConfig;
+    /**
+     * Number of rows per streaming batch.  Balances network overhead (fewer,
+     * larger batches) against progressive-rendering latency (smaller, more
+     * frequent batches).  500 rows ≈ 50–200 KB of JSON per batch.
+     */
+    private static final int BATCH_SIZE = 500;
 
-    public QueryResultWriter(SparkSession spark, StorageConfig storageConfig) {
-        this.spark         = spark;
-        this.storageConfig = storageConfig;
+    private final ResultStreamPublisher streamPublisher;
+
+    /**
+     * @param streamPublisher Redis Streams publisher for large-result streaming
+     */
+    public QueryResultWriter(ResultStreamPublisher streamPublisher) {
+        this.streamPublisher = streamPublisher;
     }
 
     /**
-     * Persists the result Dataset and returns metadata.
+     * Delivers the result Dataset using the optimal strategy.
      *
      * <p>For small results ({@code rowCount <= } {@value #INLINE_THRESHOLD}) the rows
-     * are embedded directly — no MinIO write, {@code resultPath} is {@code null}.
-     * For large results a Parquet file is written to MinIO as before.
+     * are collected and embedded directly in the returned {@link QueryResult}.
+     * For large results the rows are streamed in batches and the returned
+     * {@code QueryResult} carries only metadata ({@code streamed = true}).
      *
-     * @param result    computed result Dataset (already filtered / aggregated / limited)
-     * @param projectId project identifier used to construct the output path
-     * @return {@link QueryResult} with path, row count, file size, and inline rows
+     * @param result computed result Dataset (already filtered / aggregated / limited)
+     * @param jobId  unique job identifier (used as the stream key)
+     * @return {@link QueryResult} with inline rows or streaming metadata
      */
-    public QueryResult write(Dataset<Row> result, String projectId) {
+    public QueryResult write(Dataset<Row> result, String jobId) {
 
-        // Cache before any action so collect + write share the same partitions
-        result.cache();
+        String[] columns = result.columns();
 
-        List<Row> inlineRows = result.collectAsList();
-        String[]  columns    = result.columns();
-        long      rowCount   = inlineRows.size();
+        // ── Buffer up to INLINE_THRESHOLD + 1 rows to decide strategy ────────
+        // Uses toLocalIterator() which streams partitions one at a time,
+        // so we never load the entire result set into memory at once.
+        Iterator<Row> iterator = result.toLocalIterator();
+        List<Map<String, Object>> buffer = new ArrayList<>(INLINE_THRESHOLD + 1);
 
-        // ── Optimisation #5: skip MinIO write for small results ───────────────
-        // Rows already collected above; if the set is small enough, embed them
-        // directly in Redis and return immediately without touching MinIO.
-        if (rowCount <= INLINE_THRESHOLD) {
-            result.unpersist();
-            log.info("Inline result — rowCount={} (≤ {}), skipping MinIO write",
+        while (iterator.hasNext() && buffer.size() <= INLINE_THRESHOLD) {
+            buffer.add(rowToMap(iterator.next(), columns));
+        }
+
+        // ── Small result: return inline ──────────────────────────────────────
+        if (buffer.size() <= INLINE_THRESHOLD) {
+            long rowCount = buffer.size();
+            log.info("Inline result — rowCount={} (≤ {}), embedding in Redis",
                     rowCount, INLINE_THRESHOLD);
             return QueryResult.builder()
                     .resultPath(null)
                     .rowCount(rowCount)
                     .fileSizeBytes(0L)
-                    .resultData(toRowMaps(inlineRows, columns))
+                    .resultData(buffer)
+                    .streamed(false)
                     .build();
         }
 
-        // ── Large result: write Parquet to MinIO ──────────────────────────────
-        String timestamp    = LocalDateTime.now().format(TIMESTAMP_FMT);
-        String relativePath = "wh/" + projectId + "/queries/query_" + timestamp + "/result.parquet";
-        String s3aPath      = "s3a://" + storageConfig.getWarehouseBucket() + "/" + relativePath;
+        // ── Large result: stream via Redis Streams ───────────────────────────
+        log.info("Large result detected — streaming via Redis Streams, jobId={}", jobId);
 
-        log.info("Large result (rowCount={}) — writing Parquet to: {}", rowCount, s3aPath);
+        // 1. Publish column metadata
+        streamPublisher.publishMetadata(jobId, columns);
 
-        result.coalesce(1)
-              .write()
-              .mode(SaveMode.Overwrite)
-              .parquet(s3aPath);
+        // 2. Flush the buffer + continue iterating
+        int  batchIndex = 0;
+        long totalRows  = 0;
+        List<Map<String, Object>> batch = new ArrayList<>(BATCH_SIZE);
 
-        result.unpersist();
+        // First, drain the buffer we already collected
+        for (Map<String, Object> row : buffer) {
+            batch.add(row);
+            totalRows++;
+            if (batch.size() >= BATCH_SIZE) {
+                streamPublisher.publishBatch(jobId, batchIndex++, batch);
+                batch = new ArrayList<>(BATCH_SIZE);
+            }
+        }
 
-        long fileSizeBytes = resolveFileSize(s3aPath);
+        // Then continue with the remaining rows from the iterator
+        while (iterator.hasNext()) {
+            batch.add(rowToMap(iterator.next(), columns));
+            totalRows++;
+            if (batch.size() >= BATCH_SIZE) {
+                streamPublisher.publishBatch(jobId, batchIndex++, batch);
+                batch = new ArrayList<>(BATCH_SIZE);
+            }
+        }
 
-        log.info("Result written — rowCount={}, sizeBytes={}, path={}",
-                rowCount, fileSizeBytes, relativePath);
+        // Flush any remaining rows
+        if (!batch.isEmpty()) {
+            streamPublisher.publishBatch(jobId, batchIndex++, batch);
+        }
+
+        // 3. Publish completion marker
+        streamPublisher.publishComplete(jobId, batchIndex, totalRows);
+
+        log.info("Streaming complete — jobId={}, totalBatches={}, totalRows={}",
+                jobId, batchIndex, totalRows);
 
         return QueryResult.builder()
-                .resultPath(relativePath)
-                .rowCount(rowCount)
-                .fileSizeBytes(fileSizeBytes)
-                .resultData(toRowMaps(inlineRows, columns))
+                .resultPath(null)
+                .rowCount(totalRows)
+                .fileSizeBytes(0L)
+                .resultData(null) // no inline data for streamed results
+                .streamed(true)
                 .build();
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
 
     /**
-     * Converts Spark {@link Row} objects to plain Java maps for JSON serialisation.
+     * Converts a single Spark {@link Row} to a plain Java map.
      * Column order is preserved via {@link LinkedHashMap}.
      */
-    private List<Map<String, Object>> toRowMaps(List<Row> rows, String[] columns) {
-        return rows.stream()
-                .map(row -> {
-                    Map<String, Object> map = new LinkedHashMap<>();
-                    for (int i = 0; i < columns.length; i++) {
-                        map.put(columns[i], row.get(i));
-                    }
-                    return map;
-                })
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Resolves the total byte size of the written path using the Hadoop
-     * {@link FileSystem} API (works for both S3A and local FS).
-     * Returns {@code 0} on any error rather than failing the job.
-     */
-    private long resolveFileSize(String s3aPath) {
-        try {
-            Path         hadoopPath = new Path(s3aPath);
-            FileSystem   fs         = hadoopPath.getFileSystem(
-                    spark.sparkContext().hadoopConfiguration());
-            ContentSummary summary  = fs.getContentSummary(hadoopPath);
-            return summary.getLength();
-        } catch (Exception e) {
-            log.warn("Could not resolve file size for '{}': {}", s3aPath, e.getMessage());
-            return 0L;
+    private Map<String, Object> rowToMap(Row row, String[] columns) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        for (int i = 0; i < columns.length; i++) {
+            map.put(columns[i], row.get(i));
         }
+        return map;
     }
 }

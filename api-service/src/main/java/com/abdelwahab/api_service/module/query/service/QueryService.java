@@ -68,6 +68,7 @@ public class QueryService {
                 .status("queued")
                 .message("Query job queued for processing")
                 .checkStatusAt("/api/v1/query/" + jobId)
+                .streamUrl("/api/v1/query/" + jobId + "/stream")
                 .build();
     }
 

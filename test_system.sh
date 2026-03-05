@@ -313,7 +313,49 @@ rows=$(curl -s "${API_BASE}/api/v1/query/${job}" | jq -r '.rowCount // "?"')
 echo -e "${GREEN}  ⏱  worker: ${T[t9_worker]} ms  — ${rows} rows${NC}"
 echo ""
 
-echo -e "${BOLD}  T10 GROUP BY product  (avg price, total qty, row count)${NC}"
+echo -e "${BOLD}  T10 Streaming — SELECT * (all 1 600 rows, exceeds inline threshold)${NC}"
+t0=$(ts)
+resp=$(curl -s -X POST "${API_BASE}/api/v1/query" \
+  -H "Content-Type: application/json" \
+  -d "{\"source\":\"${SOURCE}\",\"select\":[{\"column\":\"*\"}]}")
+job=$(echo "$resp" | jq -r '.jobId')
+stream_url=$(echo "$resp" | jq -r '.streamUrl // "null"')
+record "t10_http" "$(elapsed_ms $t0)"
+label "jobId: $job  streamUrl: ${stream_url}  (HTTP ${T[t10_http]} ms)"
+
+# Wait until the job is COMPLETED so the stream is ready
+t1=$(ts)
+wait_query "$job"
+record "t10_wait" "$(elapsed_ms $t1)"
+
+# Now consume the SSE stream and count events
+t2=$(ts)
+metadata_events=0; batch_events=0; complete_events=0; total_streamed_rows=0
+current_event=""
+while IFS= read -r line; do
+    case "$line" in
+        "event:metadata") current_event=metadata; metadata_events=$((metadata_events+1)) ;;
+        "event:batch")    current_event=batch;    batch_events=$((batch_events+1)) ;;
+        "event:complete") current_event=complete; complete_events=$((complete_events+1)) ;;
+        "data:["*)
+            if [[ "$current_event" == "batch" ]]; then
+                count=$(printf '%s' "${line#data:}" | jq 'length' 2>/dev/null || echo 0)
+                total_streamed_rows=$((total_streamed_rows + count))
+            fi
+            ;;
+    esac
+done < <(curl -sN --max-time 60 "${API_BASE}${stream_url}" 2>/dev/null)
+record "t10_stream" "$(elapsed_ms $t2)"
+
+if [ "$complete_events" -ge 1 ]; then
+    pass "SSE stream complete — metadata:${metadata_events}  batches:${batch_events}  rows:${total_streamed_rows}  stream_ms:${T[t10_stream]}"
+else
+    warn "No 'complete' event received — metadata:${metadata_events}  batches:${batch_events}  rows:${total_streamed_rows}"
+fi
+echo -e "${GREEN}  ⏱  job wait: ${T[t10_wait]} ms   stream read: ${T[t10_stream]} ms${NC}"
+echo ""
+
+echo -e "${BOLD}  T11 GROUP BY product  (avg price, total qty, row count)${NC}"
 t0=$(ts)
 resp=$(curl -s -X POST "${API_BASE}/api/v1/query" \
   -H "Content-Type: application/json" \
@@ -329,13 +371,13 @@ resp=$(curl -s -X POST "${API_BASE}/api/v1/query" \
     \"orderBy\":[{\"column\":\"avg_price\",\"direction\":\"desc\"}]
   }")
 job=$(echo "$resp" | jq -r '.jobId')
-record "t10_http" "$(elapsed_ms $t0)"
-label "jobId: $job  (HTTP ${T[t10_http]} ms)"
+record "t11_http" "$(elapsed_ms $t0)"
+label "jobId: $job  (HTTP ${T[t11_http]} ms)"
 
 t0=$(ts)
 wait_query "$job"
-record "t10_worker" "$(elapsed_ms $t0)"
-echo -e "${GREEN}  ⏱  worker: ${T[t10_worker]} ms${NC}"
+record "t11_worker" "$(elapsed_ms $t0)"
+echo -e "${GREEN}  ⏱  worker: ${T[t11_worker]} ms${NC}"
 label "Results:"
 curl -s "${API_BASE}/api/v1/query/${job}" \
   | jq -r '.resultData // "[]"' \
@@ -367,9 +409,10 @@ fmt_row "T7  Schema  HIT   (re-cached)"       "${T[t7_hit2]}"         "served fr
 
 echo ""
 echo -e "  ${BOLD}── Queries (warm Spark) ──${NC}"
-fmt_row "T8  SELECT * LIMIT 100"              "${T[t8_worker]}"   ""
-fmt_row "T9  WHERE price>500 ORDER BY"        "${T[t9_worker]}"   ""
-fmt_row "T10 GROUP BY product"                "${T[t10_worker]}"  ""
+fmt_row "T8  SELECT * LIMIT 100"              "${T[t8_worker]}"    ""
+fmt_row "T9  WHERE price>500 ORDER BY"        "${T[t9_worker]}"    ""
+fmt_row "T10 SELECT * all rows — streamed"    "${T[t10_wait]}"     "SSE: ${T[t10_stream]} ms to read all batches"
+fmt_row "T11 GROUP BY product"                "${T[t11_worker]}"   ""
 
 sep
 echo ""

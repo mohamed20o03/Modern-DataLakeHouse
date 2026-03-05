@@ -1,6 +1,6 @@
 # Data Lakehouse Platform
 
-A distributed data lakehouse platform with **REST ingestion**, **SQL querying**, and **schema discovery** — built on **Apache Spark**, **Apache Iceberg**, **RabbitMQ**, **MinIO**, and **Redis**.
+A distributed data lakehouse platform with **REST ingestion**, **SQL querying**, **schema discovery**, and **progressive result streaming** — built on **Apache Spark**, **Apache Iceberg**, **RabbitMQ**, **MinIO**, and **Redis**.
 
 > **Graduation Project** — demonstrates scalable data pipeline design with measurable performance optimizations.
 
@@ -11,16 +11,13 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
 1. [Architecture](#architecture)
 2. [Services Overview](#services-overview)
 3. [Quick Start](#quick-start)
-4. [API Reference](#api-reference)
-   - [Ingestion API](#ingestion-api)
-   - [Query API](#query-api)
-   - [Schema API](#schema-api)
-   - [Long-poll /wait Endpoints](#long-poll-wait-endpoints)
-5. [Workers](#workers)
-6. [Storage Layer](#storage-layer)
-7. [Performance Optimizations](#performance-optimizations)
-8. [Environment Variables](#environment-variables)
-9. [Troubleshooting](#troubleshooting)
+4. [Documentation](#documentation)
+5. [API Reference](#api-reference)
+6. [Workers](#workers)
+7. [Storage Layer](#storage-layer)
+8. [Performance Optimizations](#performance-optimizations)
+9. [Environment Variables](#environment-variables)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -35,6 +32,7 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
 │  GET  /api/v1/schema/{source}           GET /api/v1/schema/status/{id}       │
 │                                                                               │
 │  GET  /api/v1/*/wait  ← long-poll endpoint (Redis Pub/Sub, no polling loop)  │
+│  GET  /api/v1/query/{id}/stream  ← SSE endpoint (Redis Streams → client)     │
 └──────────────┬──────────────────────────────┬───────────────────────────────┘
                │  ingestion.queue              │  query.queue (priority: 0-10)
                ▼                              ▼
@@ -52,12 +50,13 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
   │  • Reads CSV/JSON/   │  │  • Executes SQL query │
   │    Parquet/Avro from │  │    on Iceberg table   │
   │    MinIO staging     │  │  • Schema discovery   │
-  │  • Writes Iceberg    │  │  • Inline results     │
-  │    table (append     │  │    for small datasets │
-  │    with schema       │  │  • Priority: schema=8 │
-  │    evolution)        │  │    queries=1          │
-  │  • Invalidates Redis │  │  • Caches schema in   │
-  │    schema cache      │  │    Redis after fetch  │
+  │  • Writes Iceberg    │  │  • Inline (≤ 1 000)   │
+  │    table (append     │  │  • Streams via Redis  │
+  │    with schema       │  │    Streams (> 1 000)  │
+  │    evolution)        │  │  • Priority: schema=8 │
+  │  • Invalidates Redis │  │    queries=1          │
+  │    schema cache      │  │  • Caches schema in   │
+  │                      │  │    Redis after fetch  │
   └──────┬───────────────┘  └──────┬────────────────┘
          │                         │
          │    status + results      │
@@ -67,11 +66,15 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
   │                                                 │
   │  job:{jobId}  → Hash { status, message,         │
   │                        rowCount, resultData,    │
-  │                        createdAt, updatedAt }   │
+  │                        streamed, createdAt }    │
   │                                                 │
   │  schema:iceberg.{project}.{table}               │
   │             → JSON column list (no TTL,         │
   │               event-driven invalidation)        │
+  │                                                 │
+  │  query-result-stream:{jobId}                    │
+  │             → Stream entries (TTL: 1 h)         │
+  │               type=metadata|batch|complete      │
   │                                                 │
   │  Pub/Sub channel: job-done:{jobId}              │
   │    Workers PUBLISH → API /wait resolves         │
@@ -86,7 +89,6 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
   └──────────────────┘       │    Iceberg Parquet    │
                              │  s3://staging-*/      │
                              │    raw uploads        │
-                             │    query results      │
                              └──────────────────────┘
 ```
 
@@ -163,232 +165,49 @@ docker compose down -v     # stop + delete all volumes  ⚠️ data loss
 
 ---
 
+## Documentation
+
+| Document                                                                     | Audience                         | Contents                                                                                     |
+| ---------------------------------------------------------------------------- | -------------------------------- | -------------------------------------------------------------------------------------------- |
+| [docs/API_REFERENCE.md](docs/API_REFERENCE.md)                               | **Frontend / client developers** | All endpoints, request/response shapes, Query DSL, TypeScript types, JS integration examples |
+| [docs/QUERY_FLOW.md](docs/QUERY_FLOW.md)                                     | Backend, contributors            | End-to-end trace of a query from HTTP → RabbitMQ → Spark → Redis → SSE                       |
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md)                                   | Backend, contributors            | Detailed description of the 5 performance optimizations with measured results                |
+| [docs/ENHANCEMENT_GUIDE.md](docs/ENHANCEMENT_GUIDE.md)                       | Contributors                     | Conceptual guide for adding partitioning, compaction, and pagination                         |
+| [docs/PARTITIONING_ALGORITHM.md](docs/PARTITIONING_ALGORITHM.md)             | Contributors                     | Auto-partitioning algorithm design and decision logic                                        |
+| [query-worker/ENGINE_README.md](query-worker/ENGINE_README.md)               | Contributors                     | Spark engine layer internals — SparkService, QueryBuilder, ResultWriter                      |
+| [ingestion-worker/DOCKER_DEBUGGING.md](ingestion-worker/DOCKER_DEBUGGING.md) | DevOps                           | Docker container setup issues and fixes for the ingestion worker                             |
+
+---
+
 ## API Reference
 
 Base URL: `http://localhost:8080`
 
-All status responses share the same structure:
+> For the full frontend integration guide including request/response shapes, Query DSL, TypeScript types, and JavaScript examples, see **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)**.
 
-```json
-{
-  "status": "COMPLETED",
-  "message": "...",
-  "createdAt": "2026-02-26T12:00:00Z",
-  "updatedAt": "2026-02-26T12:00:03Z"
-}
-```
-
-Status lifecycle for every job type:
+Job status lifecycle:
 
 ```
 PENDING → QUEUED → PROCESSING → COMPLETED
-                              → FAILED
+                              ↘ FAILED
 ```
 
----
+### Endpoint overview
 
-### Ingestion API
+| Method | Endpoint                                | Description                            |
+| ------ | --------------------------------------- | -------------------------------------- |
+| POST   | `/api/v1/ingestion/upload`              | Upload a file and start ingestion      |
+| GET    | `/api/v1/ingestion/status/{jobId}`      | Poll ingestion job status              |
+| GET    | `/api/v1/ingestion/status/{jobId}/wait` | Long-poll — blocks until terminal      |
+| POST   | `/api/v1/query`                         | Submit a structured query              |
+| GET    | `/api/v1/query/{jobId}`                 | Poll query job status + inline results |
+| GET    | `/api/v1/query/{jobId}/wait`            | Long-poll — blocks until terminal      |
+| GET    | `/api/v1/query/{jobId}/stream`          | SSE stream — progressive row delivery  |
+| GET    | `/api/v1/schema/{source}`               | Request schema discovery for a table   |
+| GET    | `/api/v1/schema/status/{jobId}`         | Poll schema job status + column list   |
+| GET    | `/api/v1/schema/status/{jobId}/wait`    | Long-poll — blocks until terminal      |
 
-#### Upload a file
-
-**`POST /api/v1/ingestion/upload`** — `multipart/form-data`
-
-| Parameter   | Type   | Required | Description                                           |
-| ----------- | ------ | :------: | ----------------------------------------------------- |
-| `file`      | file   |    ✅    | Data file (CSV, JSON, Parquet, Avro — max 500 MB)     |
-| `userId`    | string |    ✅    | Your user identifier                                  |
-| `projectId` | string |    ✅    | Project namespace — becomes the Iceberg namespace     |
-| `tableName` | string |    ❌    | Target table (defaults to filename without extension) |
-
-```bash
-curl -X POST http://localhost:8080/api/v1/ingestion/upload \
-  -F "file=@sales.csv" \
-  -F "userId=user_001" \
-  -F "projectId=my_project" \
-  -F "tableName=sales"
-```
-
-Response:
-
-```json
-{
-  "jobId": "9622371d-719c-4492-9e37-f6ba464ce63a",
-  "status": "QUEUED",
-  "checkStatusAt": "/api/v1/ingestion/status/9622371d-719c-4492-9e37-f6ba464ce63a"
-}
-```
-
-#### Track ingestion status
-
-**`GET /api/v1/ingestion/status/{jobId}`**
-
-```bash
-curl http://localhost:8080/api/v1/ingestion/status/9622371d-...
-```
-
-#### Wait for ingestion (no polling)
-
-**`GET /api/v1/ingestion/status/{jobId}/wait?timeoutSec=30`**
-
-Blocks until the job completes or the timeout expires. See [Long-poll /wait Endpoints](#long-poll-wait-endpoints).
-
----
-
-### Query API
-
-#### Submit a query
-
-**`POST /api/v1/query`** — `application/json`
-
-| Field     | Type   | Description                                 |
-| --------- | ------ | ------------------------------------------- |
-| `source`  | string | `"projectId.tableName"` — the Iceberg table |
-| `select`  | array  | Columns to select (use `"*"` for all)       |
-| `filters` | array  | WHERE conditions                            |
-| `orderBy` | array  | ORDER BY columns with direction             |
-| `groupBy` | array  | GROUP BY columns                            |
-| `limit`   | int    | Max rows to return                          |
-
-```bash
-# SELECT * LIMIT 100
-curl -X POST http://localhost:8080/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "source": "my_project.sales",
-    "select": [{"column": "*"}],
-    "limit": 100
-  }'
-
-# WHERE + ORDER BY
-curl -X POST http://localhost:8080/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "source": "my_project.sales",
-    "select": [{"column": "id"}, {"column": "price"}],
-    "filters": [{"column": "price", "operator": ">", "value": 500}],
-    "orderBy": [{"column": "price", "direction": "desc"}],
-    "limit": 50
-  }'
-
-# GROUP BY with aggregations
-curl -X POST http://localhost:8080/api/v1/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "source": "my_project.sales",
-    "select": [
-      {"column": "product"},
-      {"column": "price", "aggregation": "avg", "as": "avg_price"},
-      {"column": "id",    "aggregation": "count", "as": "n"}
-    ],
-    "groupBy": ["product"]
-  }'
-```
-
-Response:
-
-```json
-{
-  "jobId": "query-abc123",
-  "status": "QUEUED",
-  "checkStatusAt": "/api/v1/query/query-abc123"
-}
-```
-
-#### Get query result
-
-**`GET /api/v1/query/{jobId}`**
-
-Completed response (small result — inline):
-
-```json
-{
-  "status": "COMPLETED",
-  "rowCount": "5",
-  "fileSizeBytes": "0",
-  "resultData": "[{\"product\":\"Laptop\",\"avg_price\":517}]"
-}
-```
-
-Completed response (large result — Parquet in MinIO):
-
-```json
-{
-  "status": "COMPLETED",
-  "rowCount": "50000",
-  "fileSizeBytes": "2097152",
-  "resultPath": "results/query-abc123/result.parquet"
-}
-```
-
-> Results with ≤ 1 000 rows are returned **inline** in `resultData` (no MinIO file). Larger results are written to MinIO Parquet and the path is returned in `resultPath`.
-
-#### Wait for query (no polling)
-
-**`GET /api/v1/query/{jobId}/wait?timeoutSec=30`**
-
----
-
-### Schema API
-
-#### Request schema
-
-**`GET /api/v1/schema/{source}`** — `source = "projectId.tableName"`
-
-```bash
-curl http://localhost:8080/api/v1/schema/my_project.sales
-```
-
-Response:
-
-```json
-{
-  "jobId": "schema-xyz789",
-  "status": "QUEUED",
-  "checkStatusAt": "/api/v1/schema/status/schema-xyz789"
-}
-```
-
-#### Get schema result
-
-**`GET /api/v1/schema/status/{jobId}`**
-
-```json
-{
-  "status": "COMPLETED",
-  "rowCount": "5",
-  "resultData": "[{\"name\":\"id\",\"type\":\"int\",\"nullable\":true},{\"name\":\"price\",\"type\":\"double\",\"nullable\":true}]"
-}
-```
-
-#### Wait for schema (no polling)
-
-**`GET /api/v1/schema/status/{jobId}/wait?timeoutSec=30`**
-
----
-
-### Long-poll /wait Endpoints
-
-All three job types have a `/wait` variant. Instead of polling every N seconds, a single request blocks until the job finishes:
-
-```bash
-# Submit
-JOB=$(curl -s -X POST http://localhost:8080/api/v1/ingestion/upload \
-  -F "file=@data.csv" -F "userId=u1" -F "projectId=demo" | jq -r .jobId)
-
-# Wait for completion — returns the full result in one shot
-curl -s --max-time 35 "http://localhost:8080/api/v1/ingestion/status/${JOB}/wait?timeoutSec=30" | jq .
-```
-
-**How it works:**
-
-1. If the job is already `COMPLETED`/`FAILED`, returns immediately (fast-path, no subscription)
-2. Otherwise, subscribes to Redis channel `job-done:{jobId}` and holds the HTTP connection open
-3. When the worker publishes to that channel, the response resolves instantly
-4. If the timeout expires, returns `null` — fall back to `GET /status/{jobId}`
-
-| Parameter    | Default | Description                 |
-| ------------ | ------- | --------------------------- |
-| `timeoutSec` | 30      | Max seconds to wait (1–300) |
+> For full request/response details, the Query DSL, TypeScript types, and JavaScript examples, see **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)**.
 
 ---
 
@@ -431,10 +250,10 @@ Consumes `QueryMessage` from `query.queue` (priority queue, 0–10):
 
 1. Builds a Spark SQL statement from the structured query request
 2. Executes it against the Iceberg table
-3. If `rowCount ≤ 1 000` → serializes result to JSON inline (skips MinIO write)
-4. If `rowCount > 1 000` → writes Parquet to MinIO results bucket
+3. If `rowCount ≤ 1 000` → serializes result to JSON inline (stored in Redis status hash under `resultData`)
+4. If `rowCount > 1 000` → streams result in batches of 500 rows via `toLocalIterator()` to a Redis Stream (`query-result-stream:{jobId}`, TTL: 1 h) — no MinIO write
 5. Publishes `job-done:{jobId}` event to Redis Pub/Sub
-6. Updates job status with result metadata
+6. Updates job status with result metadata (`streamed: true` for large results)
 
 Schema jobs run on the same worker but at **priority 8** (vs. query priority 1), so they are never blocked by a backlog of data queries.
 
@@ -444,11 +263,11 @@ Schema jobs run on the same worker but at **priority 8** (vs. query priority 1),
 
 Three stores with three different roles:
 
-| Store          | Content                           | Why                                  | Retention                          |
-| -------------- | --------------------------------- | ------------------------------------ | ---------------------------------- |
-| **PostgreSQL** | Iceberg table/snapshot metadata   | ACID coordination, catalog registry  | Permanent                          |
-| **MinIO**      | Parquet data + query result files | Cheap S3-compatible object storage   | Permanent                          |
-| **Redis**      | Job status hashes + schema cache  | Sub-millisecond lookups, auto-expiry | 1 h (jobs) / event-driven (schema) |
+| Store          | Content                                         | Why                                  | Retention                                    |
+| -------------- | ----------------------------------------------- | ------------------------------------ | -------------------------------------------- |
+| **PostgreSQL** | Iceberg table/snapshot metadata                 | ACID coordination, catalog registry  | Permanent                                    |
+| **MinIO**      | Parquet data files (Iceberg only)               | Cheap S3-compatible object storage   | Permanent                                    |
+| **Redis**      | Job status hashes, schema cache, result streams | Sub-millisecond lookups, auto-expiry | 1 h (jobs + streams) / event-driven (schema) |
 
 **MinIO bucket layout:**
 
@@ -460,149 +279,37 @@ s3://warehouse/
 
 s3://staging-applicationarea/
   ingestion/{jobId}/file.csv    ← raw uploaded files
-  results/{jobId}/result.parquet ← large query results (>1 000 rows)
 ```
 
 ---
 
 ## Performance Optimizations
 
-Five optimizations were implemented and validated end-to-end. All timings below are from a live test run on the full stack.
+Five optimizations were implemented and validated end-to-end. See **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)** for the full analysis including measured results for each optimization.
 
-### Optimization #1 — Spark Session Warm-up
+| Optimization          | Technique                                         | Key result                            |
+| --------------------- | ------------------------------------------------- | ------------------------------------- |
+| #1 Spark warm-up      | `SELECT 1` at startup                             | Cold-start: 10 s → 3.8 s              |
+| #2 Schema Redis cache | Cache schema JSON, invalidate on ingest           | Schema hit: 185 ms → 10 ms (18×)      |
+| #3 Priority queue     | Schema at priority 8, queries at priority 1       | Schema latency predictable under load |
+| #4 Redis Pub/Sub      | `/wait` long-poll replaces client polling         | 5 000 ms polling wait → ~374 ms       |
+| #5 Inline + SSE       | ≤1 000 rows inline, >1 000 rows via Redis Streams | No MinIO write for any query          |
 
-**Problem:** The first job after a worker restart pays a ~5 s cold-start penalty as Spark lazily initializes the Iceberg catalog, S3A filesystem, and executor pool.
+### End-to-end results (all optimizations combined)
 
-**Fix:** Run `SELECT 1` immediately after `SparkSession.getOrCreate()` to force all lazy components to initialize before the first real job arrives.
-
-```java
-// SparkEngine.java
-spark.sql("SELECT 1").count();  // forces catalog + executor init
-```
-
-**Measured results:**
-
-| Job                          | Before | After  |
-| ---------------------------- | ------ | ------ |
-| First ingestion (1 000 rows) | ~10 s  | 3.8 s  |
-| Second ingestion (500 rows)  | ~5 s   | 374 ms |
-
----
-
-### Optimization #2 — Schema Redis Cache
-
-**Problem:** Every schema request triggered a full Spark + Iceberg catalog round-trip (reads table metadata from PostgreSQL + MinIO), even though the schema only changes when new data is ingested.
-
-**Fix:** Cache the schema JSON in Redis after the first retrieval with no TTL. Invalidate the cache key only when the ingestion worker writes new data.
-
-```
-First schema request:
-  query-worker → Iceberg catalog → schema JSON → Redis (no TTL) → client
-
-Subsequent requests:
-  query-worker → Redis HIT → client  (~10 ms)
-
-After ingestion:
-  ingestion-worker → Redis DEL("schema:iceberg.{project}.{table}")
-```
-
-**Measured results:**
-
-| Request          | Time   | Path            |
-| ---------------- | ------ | --------------- |
-| Schema MISS      | 185 ms | Spark + Iceberg |
-| Schema HIT       | 10 ms  | Redis           |
-| Post-ingest MISS | 31 ms  | Spark + Iceberg |
-| Re-cached HIT    | 11 ms  | Redis           |
-
-**~18× faster on cache hit.**
-
----
-
-### Optimization #3 — RabbitMQ Priority Queue
-
-**Problem:** Schema and data query messages shared the same queue without priority. A backlog of slow aggregation queries could block a fast schema request for many seconds.
-
-**Fix:** Configure `x-max-priority=10` on `query.queue`. Schema messages are published at priority 8, data queries at priority 1 — so schema jobs always jump to the front of the queue.
-
-```java
-// Schema → delivered first
-messageProperties.setPriority(8);
-
-// Query → normal priority
-messageProperties.setPriority(1);
-```
-
-**Effect:** Schema latency becomes **predictable** regardless of how many data queries are pending.
-
----
-
-### Optimization #4 — Redis Pub/Sub (Eliminate Client Polling)
-
-**Problem:** Clients polled `GET /status/{jobId}` every 1–5 seconds. This wastes time — a job completing in 400 ms still had to wait up to 5 seconds before the client found out. It also adds unnecessary Redis and API load.
-
-**Fix:** Workers publish a `job-done:{jobId}` Pub/Sub event when a job reaches a terminal state. The API service exposes `/wait` long-poll endpoints backed by `DeferredResult` + a `RedisMessageListenerContainer` subscription. The HTTP response resolves the instant the event fires.
-
-```
-Worker finishes:
-  Redis PUBLISH "job-done:{jobId}" "COMPLETED"
-       ↓
-API service (subscribed via Spring RedisMessageListenerContainer):
-  reads full job Hash → resolves DeferredResult → HTTP response sent
-```
-
-**Fast-path:** If the job is already terminal when `/wait` is called, it returns immediately without subscribing.
-
-**Measured results:**
-
-| Scenario               | Old (polling loop) | New (/wait) |
-| ---------------------- | ------------------ | ----------- |
-| Ingestion (374 ms job) | up to 5 000 ms     | ~374 ms     |
-| Schema HIT (10 ms job) | ~1 000 ms          | ~10 ms      |
-| Query (670 ms job)     | up to 1 000 ms     | ~670 ms     |
-
----
-
-### Optimization #5 — Inline Results for Small Queries
-
-**Problem:** Every query wrote a Parquet file to MinIO, even for tiny result sets (5 rows, schema with 6 columns). This involved Spark serialization, an HTTP PUT to MinIO, and a second client request to fetch the file.
-
-**Fix:** If `rowCount ≤ 1 000`, serialize the result as JSON and embed it directly in the Redis status hash (`resultData` field). Skip the MinIO write entirely.
-
-```java
-// QueryResultWriter.java
-if (rowCount <= INLINE_THRESHOLD) {          // INLINE_THRESHOLD = 1 000
-    return QueryResult.inline(json, rowCount); // resultPath = null, fileSizeBytes = 0
-}
-return QueryResult.external(minioPath, rowCount);
-```
-
-**Measured results:**
-
-| Query                | Time   | Result delivery |
-| -------------------- | ------ | --------------- |
-| SELECT \* LIMIT 100  | 2.8 s  | inline JSON     |
-| WHERE + ORDER BY     | 670 ms | inline JSON     |
-| GROUP BY aggregation | 850 ms | inline JSON     |
-
-All test queries return inline — no MinIO round-trip needed.
-
----
-
-### Combined Results Summary
-
-| Test                              | Worker time | Notes                                |
-| --------------------------------- | ----------- | ------------------------------------ |
-| T1 Initial ingestion (1 000 rows) | 3 806 ms    | warm session — no cold-start penalty |
-| T2 Append ingestion (500 rows)    | 374 ms      | subsequent job on warm session       |
-| T3 Schema MISS (→ Spark)          | 185 ms      | cache empty, fetches from Iceberg    |
-| T4 Schema HIT (→ Redis)           | 10 ms       | served from Redis (~18× faster)      |
-| T5 Ingestion invalidates cache    | 579 ms      | DEL called by ingestion-worker       |
-| T6 Schema MISS (post-ingest)      | 31 ms       | re-fetches updated 6-column schema   |
-| T7 Schema HIT (re-cached)         | 11 ms       | served from Redis again              |
-| T8 SELECT \* LIMIT 100            | 2 819 ms    | warm Spark + inline result           |
-| T9 WHERE + ORDER BY               | 670 ms      | warm Spark + inline result           |
-| T10 GROUP BY aggregation          | 850 ms      | warm Spark + inline result           |
+| Test                                  | Worker time | Notes                                      |
+| ------------------------------------- | ----------- | ------------------------------------------ |
+| T1 Initial ingestion (1 000 rows)     | 489 ms      | warm session — no cold-start penalty       |
+| T2 Append ingestion (500 rows)        | 636 ms      | subsequent job on warm session             |
+| T3 Schema MISS (→ Spark)              | 24 ms       | cache empty, fetches from Iceberg          |
+| T4 Schema HIT (→ Redis)               | 13 ms       | served from Redis (~2× faster)             |
+| T5 Ingestion invalidates cache        | 582 ms      | DEL called by ingestion-worker             |
+| T6 Schema MISS (post-ingest)          | 37 ms       | re-fetches updated 6-column schema         |
+| T7 Schema HIT (re-cached)             | 29 ms       | served from Redis again                    |
+| T8 SELECT \* LIMIT 100                | 237 ms      | warm Spark + inline result                 |
+| T9 WHERE + ORDER BY LIMIT 50          | 124 ms      | warm Spark + inline result                 |
+| T10 SELECT \* all 1 600 rows (stream) | 227 ms      | 4 SSE batches × 500 rows, SSE read: 215 ms |
+| T11 GROUP BY aggregation              | 396 ms      | warm Spark + inline result                 |
 
 ---
 

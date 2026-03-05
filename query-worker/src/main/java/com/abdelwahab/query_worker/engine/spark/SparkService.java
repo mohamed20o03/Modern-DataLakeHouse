@@ -7,6 +7,7 @@ import com.abdelwahab.query_worker.dto.query.QueryResult;
 import com.abdelwahab.query_worker.engine.QueryService;
 import com.abdelwahab.query_worker.status.JobStatusService;
 import com.abdelwahab.query_worker.storage.StorageConfig;
+import com.abdelwahab.query_worker.streaming.ResultStreamPublisher;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.spark.sql.Dataset;
@@ -80,16 +81,19 @@ public class SparkService implements QueryService {
      * @param spark            active SparkSession with Iceberg catalog and S3A configured
      * @param jobStatusService async Redis client for reporting job progress
      * @param storageConfig    storage credentials and bucket names
+     * @param schemaCache      cache for Iceberg table schemas
+     * @param streamPublisher  publishes large result batches via Redis Streams
      */
     public SparkService(SparkSession spark,
                         JobStatusService jobStatusService,
                         StorageConfig storageConfig,
-                        SchemaCacheService schemaCache) {
+                        SchemaCacheService schemaCache,
+                        ResultStreamPublisher streamPublisher) {
         this.spark            = spark;
         this.jobStatusService = jobStatusService;
         this.schemaCache      = schemaCache;
         this.queryBuilder     = new SparkQueryBuilder(spark);
-        this.resultWriter     = new QueryResultWriter(spark, storageConfig);
+        this.resultWriter     = new QueryResultWriter(streamPublisher);
         this.objectMapper     = new ObjectMapper().registerModule(new JavaTimeModule());
 
         log.info("SparkService initialized — warehouse: {}", storageConfig.getWarehouseBucket());
@@ -110,9 +114,8 @@ public class SparkService implements QueryService {
             // 1. Mark PROCESSING — fire-and-forget (does not block Spark thread)
             jobStatusService.writeStatus(jobId, "PROCESSING", null);
 
-            // 2. Resolve fully-qualified Iceberg table name and project identifier
+            // 2. Resolve fully-qualified Iceberg table name
             String icebergTable = resolveIcebergTable(message.getSource());
-            String projectId    = extractProjectId(message.getSource());
             log.info("Resolved table: {}", icebergTable);
 
             // 3a. Schema job — check Redis cache before touching Spark
@@ -123,7 +126,7 @@ public class SparkService implements QueryService {
                     jobStatusService.writeResult(
                             jobId, "COMPLETED",
                             "Schema retrieved from cache: " + fields + " columns from table " + icebergTable,
-                            null, fields, 0L, cached
+                            null, fields, 0L, cached, false
                     ).join();
                     log.info("Job completed (schema cache): jobId={}, fields={}", jobId, fields);
                     return;
@@ -133,7 +136,7 @@ public class SparkService implements QueryService {
             // 3b. Execute via Spark — cache miss or regular query
             QueryResult result = isSchemaJob(jobId)
                     ? executeSchemaJob(icebergTable)
-                    : executeQueryJob(message, icebergTable, projectId);
+                    : executeQueryJob(message, icebergTable, jobId);
 
             // 3c. Populate cache after first Spark schema fetch
             if (isSchemaJob(jobId)) {
@@ -148,7 +151,8 @@ public class SparkService implements QueryService {
                     result.getResultPath(),
                     result.getRowCount(),
                     result.getFileSizeBytes(),
-                    serializeResultData(result.getResultData())
+                    serializeResultData(result.getResultData()),
+                    result.isStreamed()
             ).join();
 
             log.info("Job completed: jobId={}, rows={}", jobId, result.getRowCount());
@@ -168,7 +172,7 @@ public class SparkService implements QueryService {
      */
     private QueryResult executeQueryJob(QueryMessage message,
                                         String icebergTable,
-                                        String projectId) throws Exception {
+                                        String jobId) throws Exception {
         QueryRequest request = parseQueryRequest(message.getQueryJson());
         log.info("Executing query — table: {}, selectCols: {}, filters: {}",
                 icebergTable,
@@ -176,7 +180,7 @@ public class SparkService implements QueryService {
                 request.getFilters() != null ? request.getFilters().size() : 0);
 
         Dataset<Row> result = queryBuilder.build(icebergTable, request);
-        return resultWriter.write(result, projectId);
+        return resultWriter.write(result, jobId);
     }
 
     /**
@@ -232,12 +236,6 @@ public class SparkService implements QueryService {
                 : ICEBERG_CATALOG + "." + source;
     }
 
-    /** Extracts the {@code projectId} from {@code "{projectId}.{tableName}"}. */
-    private String extractProjectId(String source) {
-        int dot = source.indexOf('.');
-        return dot > 0 ? source.substring(0, dot) : source;
-    }
-
     /** Returns {@code true} when the jobId belongs to a schema-retrieval job. */
     private boolean isSchemaJob(String jobId) {
         return jobId != null && jobId.startsWith(JOB_PREFIX_SCHEMA);
@@ -257,9 +255,13 @@ public class SparkService implements QueryService {
 
     /** Builds the human-readable status message stored in Redis. */
     private String buildCompletionMessage(QueryResult result, String icebergTable) {
+        if (result.isStreamed()) {
+            return String.format("Query completed (streamed): %d rows from table %s",
+                    result.getRowCount(), icebergTable);
+        }
         if (result.getResultPath() == null) {
-            // Schema job — no Parquet file written
-            return String.format("Schema retrieved: %d columns from table %s",
+            // Schema job or small inline result
+            return String.format("Query completed: %d rows from table %s (inline)",
                     result.getRowCount(), icebergTable);
         }
         return String.format("Query completed: %d rows, result stored at %s",
