@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- CDC Worker classes: INFO for lifecycle, DEBUG for per-batch -->
+    <logger name="com.abdelwahab.cdc_worker" level="INFO"/>
+    <logger name="com.abdelwahab.cdc_worker.engine.spark.IcebergMergeWriter" level="INFO"/>
+    <logger name="com.abdelwahab.cdc_worker.engine.spark.EventDeduplicator" level="INFO"/>
+    <logger name="com.abdelwahab.cdc_worker.engine.spark.DebeziumEventParser" level="INFO"/>
+
+    <!-- Reduce Spark/Iceberg noise -->
+    <logger name="org.apache.spark" level="WARN"/>
+    <logger name="org.apache.iceberg" level="WARN"/>
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="org.apache.hadoop" level="WARN"/>
+    <logger name="io.lettuce" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

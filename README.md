@@ -1,6 +1,6 @@
 # Data Lakehouse Platform
 
-A distributed data lakehouse platform with **REST ingestion**, **SQL querying**, **schema discovery**, and **progressive result streaming** — built on **Apache Spark**, **Apache Iceberg**, **RabbitMQ**, **MinIO**, and **Redis**.
+A distributed data lakehouse platform with **REST ingestion**, **SQL querying**, **schema discovery**, **progressive result streaming**, and **real-time CDC (Change Data Capture)** — built on **Apache Spark**, **Apache Iceberg**, **Kafka**, **Debezium**, **RabbitMQ**, **MinIO**, and **Redis**.
 
 > **Graduation Project** — demonstrates scalable data pipeline design with measurable performance optimizations.
 
@@ -24,26 +24,54 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
 ## Architecture
 
 ```
+  ┌────────────────────┐
+  │  SOURCE POSTGRES   │   (wal_level = logical)
+  │  :5432             │
+  │  customers table   │
+  └────────┬───────────┘
+           │  WAL stream (pgoutput)
+           ▼
+  ┌────────────────────┐         ┌─────────────────────────────────────────┐
+  │ DEBEZIUM CONNECT   │────────▶│              KAFKA (KRaft)              │
+  │  :8083             │  CDC    │  :9092 / :29092                         │
+  │  pgoutput plugin   │ events  │  topic: cdc.public.customers            │
+  └────────────────────┘         └─────────────────┬───────────────────────┘
+                                                   │
+                                                   ▼
+                                    ┌──────────────────────┐
+                                    │    CDC WORKER        │
+                                    │  Spark Structured    │
+                                    │  Streaming + Iceberg │
+                                    │                      │
+                                    │  • Kafka consumer    │
+                                    │  • Debezium parser   │
+                                    │  • Deduplication     │
+                                    │  • MERGE INTO (upsert│
+                                    │    + delete)         │
+                                    │  • Compaction        │
+                                    │  • Snapshot tagging  │
+                                    └──────────┬───────────┘
+                                               │
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                          API SERVICE  :8080                                   │
-│                                                                               │
+│                          API SERVICE  :8080                                  │
+│                                                                              │
 │  POST /api/v1/ingestion/upload          GET /api/v1/ingestion/status/{id}    │
 │  POST /api/v1/query                     GET /api/v1/query/{id}               │
 │  GET  /api/v1/schema/{source}           GET /api/v1/schema/status/{id}       │
-│                                                                               │
+│                                                                              │
 │  GET  /api/v1/*/wait  ← long-poll endpoint (Redis Pub/Sub, no polling loop)  │
 │  GET  /api/v1/query/{id}/stream  ← SSE endpoint (Redis Streams → client)     │
-└──────────────┬──────────────────────────────┬───────────────────────────────┘
-               │  ingestion.queue              │  query.queue (priority: 0-10)
+└──────────────┬──────────────────────────────┬────────────────────────────────┘
+               │  ingestion.queue             │  query.queue (priority: 0-10)
                ▼                              ▼
         ┌─────────────────────────────────────────┐
-        │              RabbitMQ  :5672             │
-        │   ingestion.queue   │   query.queue      │
-        │   (data ingestion)  │   (queries+schema) │
-        └────────┬────────────┴────────┬───────────┘
+        │              RabbitMQ  :5672            │
+        │   ingestion.queue   │   query.queue     │
+        │   (data ingestion)  │   (queries+schema)│
+        └────────┬────────────┴────────┬──────────┘
                  │                     │
                  ▼                     ▼
-  ┌──────────────────────┐  ┌──────────────────────┐
+  ┌──────────────────────┐  ┌───────────────────────┐
   │  INGESTION WORKER    │  │    QUERY WORKER       │
   │  Spark 3.5 + Iceberg │  │  Spark 3.5 + Iceberg  │
   │                      │  │                       │
@@ -59,9 +87,9 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
   │                      │  │    Redis after fetch  │
   └──────┬───────────────┘  └──────┬────────────────┘
          │                         │
-         │    status + results      │
+         │    status + results     │
          ▼                         ▼
-  ┌────────────────────────────────────────────────┐
+  ┌─────────────────────────────────────────────────┐
   │                    Redis  :6379                 │
   │                                                 │
   │  job:{jobId}  → Hash { status, message,         │
@@ -78,17 +106,17 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
   │                                                 │
   │  Pub/Sub channel: job-done:{jobId}              │
   │    Workers PUBLISH → API /wait resolves         │
-  └────────────────────────────────────────────────┘
+  └─────────────────────────────────────────────────┘
          │ metadata
          ▼
   ┌──────────────────┐       ┌──────────────────────┐
-  │  Iceberg REST    │       │        MinIO          │
-  │  Catalog :8181   │       │   :9000 / :9001       │
-  │  (PostgreSQL     │       │                       │
-  │   backed)        │       │  s3://warehouse/      │
-  └──────────────────┘       │    Iceberg Parquet    │
-                             │  s3://staging-*/      │
-                             │    raw uploads        │
+  │  Iceberg REST    │       │        MinIO         │
+  │  Catalog :8181   │       │   :9000 / :9001      │
+  │  (PostgreSQL     │       │                      │
+  │   backed)        │       │  s3://warehouse/     │
+  └──────────────────┘       │    Iceberg Parquet   │
+                             │  s3://staging-*/     │
+                             │    raw uploads       │
                              └──────────────────────┘
 ```
 
@@ -101,6 +129,10 @@ A distributed data lakehouse platform with **REST ingestion**, **SQL querying**,
 | `api-service`          | custom (Spring Boot 3)   | 8080        | REST gateway — upload, query, schema      |
 | `ingestion-worker`     | custom (Spark + Iceberg) | —           | Spark job: file → Iceberg table           |
 | `query-worker`         | custom (Spark + Iceberg) | —           | Spark job: SQL queries + schema discovery |
+| `cdc-worker`           | custom (Spark + Iceberg) | —           | CDC: Kafka → Iceberg (MERGE INTO)         |
+| `source-postgres`      | postgres:15-alpine       | 5433        | Source database with logical replication   |
+| `kafka`                | apache/kafka (KRaft)     | 9092        | Event streaming (Debezium CDC events)      |
+| `debezium-connect`     | debezium/connect:2.5     | 8083        | PostgreSQL CDC connector (pgoutput)        |
 | `minio`                | minio/minio              | 9000, 9001  | Object storage (uploads + Parquet files)  |
 | `rabbitmq`             | rabbitmq:3-management    | 5672, 15672 | Priority message queue                    |
 | `redis`                | redis:7-alpine           | 6379        | Job status, schema cache, Pub/Sub events  |
@@ -130,11 +162,15 @@ NAME                   STATUS
 api-service            Up (healthy)
 catalog-postgres       Up (healthy)
 iceberg-rest-catalog   Up (healthy)
+kafka                  Up (healthy)
+source-postgres        Up (healthy)
+debezium-connect       Up (healthy)
 minio                  Up (healthy)
 rabbitmq               Up (healthy)
 redis                  Up (healthy)
 ingestion-worker       Up
 query-worker           Up
+cdc-worker             Up
 ```
 
 ### 3. Quick health checks
@@ -257,6 +293,37 @@ Consumes `QueryMessage` from `query.queue` (priority queue, 0–10):
 
 Schema jobs run on the same worker but at **priority 8** (vs. query priority 1), so they are never blocked by a backlog of data queries.
 
+### CDC Worker
+
+Continuously syncs the source PostgreSQL database to the Iceberg lakehouse via Change Data Capture:
+
+1. Consumes CDC events from Kafka topic `cdc.public.customers` (produced by Debezium)
+2. Parses Debezium envelope (extracts `op`, `before`/`after`, `ts_ms`)
+3. Deduplicates events within each micro-batch (keeps latest per primary key)
+4. Executes `MERGE INTO` on the target Iceberg table:
+   - `op = c` (create) → INSERT
+   - `op = u` (update) → UPDATE SET
+   - `op = r` (read/snapshot) → UPSERT
+   - `op = d` (delete) → DELETE
+5. Reports status to Redis
+
+**Maintenance operations** (CLI):
+
+| Command | Description |
+|---------|-------------|
+| `docker compose run cdc-worker --compact <table>` | Bin-pack compaction (merges small files) |
+| `docker compose run cdc-worker --tag <table> <tagName> [snapshotId]` | Tag a snapshot for ML training |
+| `docker compose run cdc-worker --expire-snapshots <table> [retainDays]` | Remove old snapshots (tagged survive) |
+
+**CDC tuning:**
+
+| Setting | Value |
+|---------|-------|
+| Trigger interval | 30 seconds (configurable via `CDC_TRIGGER_INTERVAL`) |
+| Iceberg format version | 2 (row-level deletes) |
+| Write mode | Merge-on-read |
+| Compaction strategy | Bin-pack (min 2 input files, target 128 MiB) |
+
 ---
 
 ## Storage Layer
@@ -354,6 +421,34 @@ POSTGRES_PASSWORD=iceberg_password
 POSTGRES_DB=iceberg_catalog
 ```
 
+### Source PostgreSQL (CDC)
+
+```env
+SOURCE_POSTGRES_HOST=source-postgres
+SOURCE_POSTGRES_PORT=5432
+SOURCE_POSTGRES_DB=sourcedb
+SOURCE_POSTGRES_USER=debezium
+SOURCE_POSTGRES_PASSWORD=debezium
+```
+
+### Kafka
+
+```env
+KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+```
+
+### CDC Worker
+
+```env
+CDC_TOPIC_PREFIX=cdc
+CDC_TABLE_INCLUDE_LIST=public.customers
+CDC_TARGET_NAMESPACE=cdc_namespace
+CDC_TRIGGER_INTERVAL=30 seconds
+CDC_CHECKPOINT_DIR=s3a://warehouse/checkpoints/cdc
+COMPACTION_TARGET_FILE_SIZE_MB=128
+SNAPSHOT_RETAIN_DAYS=7
+```
+
 ### Iceberg
 
 ```env
@@ -404,13 +499,15 @@ docker compose restart <service-name>
 Services start in dependency order — Docker waits for each health check:
 
 ```
-minio + redis + rabbitmq + catalog-postgres
+minio + redis + rabbitmq + catalog-postgres + source-postgres + kafka
                ↓
           minio-setup  (creates buckets)
                ↓
-       iceberg-rest-catalog
+       iceberg-rest-catalog + debezium-connect
                ↓
-    api-service + ingestion-worker + query-worker
+    api-service + ingestion-worker + query-worker + cdc-worker
+               ↓
+    register-connector (init container → registers Debezium connector)
 ```
 
 ### Force rebuild after source changes

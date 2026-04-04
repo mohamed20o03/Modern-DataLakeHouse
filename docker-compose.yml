@@ -251,8 +251,154 @@ services:
       iceberg-rest-catalog:
         condition: service_healthy
 
+  # ============ CDC Infrastructure ============
+  source-postgres:
+    image: postgres:16-alpine
+    container_name: source-postgres
+    ports:
+      - "${SOURCE_POSTGRES_PORT_EXTERNAL}:5432"
+    environment:
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${SOURCE_POSTGRES_DB}
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=4"
+      - "-c"
+      - "max_wal_senders=4"
+    volumes:
+      - source_db_data:/var/lib/postgresql/data
+      - ./source-db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SOURCE_POSTGRES_USER} -d ${SOURCE_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    ports:
+      - "${KAFKA_PORT_EXTERNAL}:9092"
+    environment:
+      # KRaft mode settings (no Zookeeper)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Listeners
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Cluster
+      CLUSTER_ID: "eW0p0w_NR3e-10iZ0-FfXQ"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  debezium-connect:
+    image: debezium/connect:2.5
+    container_name: debezium-connect
+    ports:
+      - "${DEBEZIUM_CONNECT_PORT}:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    depends_on:
+      kafka:
+        condition: service_healthy
+      source-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  debezium-init:
+    image: curlimages/curl:latest
+    container_name: debezium-init
+    depends_on:
+      debezium-connect:
+        condition: service_healthy
+    environment:
+      - CONNECT_URL=http://debezium-connect:8083
+      - SOURCE_POSTGRES_USER=${SOURCE_POSTGRES_USER}
+      - SOURCE_POSTGRES_PASSWORD=${SOURCE_POSTGRES_PASSWORD}
+      - SOURCE_POSTGRES_DB=${SOURCE_POSTGRES_DB}
+      - CDC_TOPIC_PREFIX=${CDC_TOPIC_PREFIX}
+      - CDC_TABLE_INCLUDE_LIST=${CDC_TABLE_INCLUDE_LIST}
+    volumes:
+      - ./source-db/register-connector.sh:/register-connector.sh:ro
+    entrypoint: ["/bin/sh", "/register-connector.sh"]
+
+  # ============ CDC Worker ============
+  cdc-worker:
+    build: ./cdc-worker
+    container_name: cdc-worker
+    restart: unless-stopped
+    environment:
+      # Kafka Configuration
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+      - CDC_TOPIC_PREFIX=${CDC_TOPIC_PREFIX}
+      - CDC_TABLE_INCLUDE_LIST=${CDC_TABLE_INCLUDE_LIST}
+      # Streaming Configuration
+      - CDC_TRIGGER_INTERVAL=${CDC_TRIGGER_INTERVAL}
+      - CDC_CHECKPOINT_DIR=${CDC_CHECKPOINT_DIR}
+      - CDC_TARGET_NAMESPACE=${CDC_TARGET_NAMESPACE}
+      # Redis Configuration
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      # Iceberg Configuration
+      - ICEBERG_CATALOG_URI=${ICEBERG_CATALOG_URI}
+      - ICEBERG_WAREHOUSE=${ICEBERG_WAREHOUSE}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - AWS_REGION=${AWS_REGION}
+      # Engine Configuration
+      - CDC_ENGINE=${CDC_ENGINE}
+      # Compaction & Snapshot
+      - COMPACTION_TARGET_FILE_SIZE_BYTES=${COMPACTION_TARGET_FILE_SIZE_BYTES}
+      - SNAPSHOT_RETAIN_DAYS=${SNAPSHOT_RETAIN_DAYS}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      iceberg-rest-catalog:
+        condition: service_healthy
+      debezium-init:
+        condition: service_completed_successfully
+
 volumes:
   minio_data:
   rabbitmq_data:
   redis_data:
   catalog_db:
+  source_db_data:
+  kafka_data:
+
