@@ -242,6 +242,11 @@ PENDING → QUEUED → PROCESSING → COMPLETED
 | GET    | `/api/v1/schema/{source}`               | Request schema discovery for a table   |
 | GET    | `/api/v1/schema/status/{jobId}`         | Poll schema job status + column list   |
 | GET    | `/api/v1/schema/status/{jobId}/wait`    | Long-poll — blocks until terminal      |
+| POST   | `/api/v1/cdc/connections`               | Register a real-time CDC connection    |
+| GET    | `/api/v1/cdc/connections`               | List all streaming connections         |
+| GET    | `/api/v1/cdc/connections/{id}`          | Poll connection status                 |
+| GET    | `/api/v1/cdc/connections/{id}/wait`     | Long-poll — blocks until STREAMING     |
+| DELETE | `/api/v1/cdc/connections/{id}`          | Delete and stop streaming connection   |
 
 > For full request/response details, the Query DSL, TypeScript types, and JavaScript examples, see **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)**.
 
@@ -295,17 +300,17 @@ Schema jobs run on the same worker but at **priority 8** (vs. query priority 1),
 
 ### CDC Worker
 
-Continuously syncs the source PostgreSQL database to the Iceberg lakehouse via Change Data Capture:
+Continuously syncs the source PostgreSQL database to the Iceberg lakehouse via a dynamic Change Data Capture architecture:
 
-1. Consumes CDC events from Kafka topic `cdc.public.customers` (produced by Debezium)
-2. Parses Debezium envelope (extracts `op`, `before`/`after`, `ts_ms`)
-3. Deduplicates events within each micro-batch (keeps latest per primary key)
-4. Executes `MERGE INTO` on the target Iceberg table:
+1. **Dynamic Registration**: Connections are registered via `POST /api/v1/cdc/connections` where source DB passwords are encrypted at rest via AES-256-GCM.
+2. **Auto-Discovery**: The worker automatically sniffs for new topics published by Debezium using regex pattern `cdc\..*`.
+3. **Dynamic Schema Inference**: The worker extracts the latest `after` payload, dynamically uses `schema_of_json` to determine the native Spark schema, and parses the columns on the fly.
+4. **Generic Processing**: Deduplicates micro-batches using Kafka offsets and generates schema-agnostic `MERGE INTO` SQL for Iceberg:
    - `op = c` (create) → INSERT
    - `op = u` (update) → UPDATE SET
    - `op = r` (read/snapshot) → UPSERT
    - `op = d` (delete) → DELETE
-5. Reports status to Redis
+5. **Orchestration**: Listens for RabbitMQ commands (`DELETE`) to halt streaming and actively reports `STREAMING` / `FAILED` statuses to Redis.
 
 **Maintenance operations** (CLI):
 

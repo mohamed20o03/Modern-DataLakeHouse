@@ -46,6 +46,12 @@ public final class CdcConfig {
     // ── Engine ───────────────────────────────────────────────────────────────
     private final String cdcEngine;
 
+    // ── RabbitMQ ─────────────────────────────────────────────────────────────
+    private final String rabbitHost;
+    private final int    rabbitPort;
+    private final String rabbitUsername;
+    private final String rabbitPassword;
+
     public CdcConfig() {
         // Kafka
         this.kafkaBootstrapServers = env("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092");
@@ -81,8 +87,15 @@ public final class CdcConfig {
         // Engine
         this.cdcEngine = env("CDC_ENGINE", "spark");
 
-        log.info("CdcConfig loaded — kafka={}, topic-prefix={}, trigger={}, namespace={}",
-                kafkaBootstrapServers, cdcTopicPrefix, cdcTriggerInterval, cdcTargetNamespace);
+        // RabbitMQ
+        this.rabbitHost     = env("RABBITMQ_HOST", "rabbitmq");
+        this.rabbitPort     = Integer.parseInt(env("RABBITMQ_PORT", "5672"));
+        this.rabbitUsername  = env("RABBITMQ_USERNAME", "admin");
+        this.rabbitPassword  = env("RABBITMQ_PASSWORD", "changeme_in_production");
+
+        log.info("CdcConfig loaded — kafka={}, topic-prefix={}, trigger={}, namespace={}, rabbit={}:{}",
+                kafkaBootstrapServers, cdcTopicPrefix, cdcTriggerInterval, cdcTargetNamespace,
+                rabbitHost, rabbitPort);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -112,6 +125,10 @@ public final class CdcConfig {
     public long   getCompactionTargetFileSizeBytes(){ return compactionTargetFileSizeBytes; }
     public int    getSnapshotRetainDays()           { return snapshotRetainDays; }
     public String getCdcEngine()                   { return cdcEngine; }
+    public String getRabbitHost()                   { return rabbitHost; }
+    public int    getRabbitPort()                   { return rabbitPort; }
+    public String getRabbitUsername()               { return rabbitUsername; }
+    public String getRabbitPassword()               { return rabbitPassword; }
 
     /**
      * Derives the Kafka topic name for a given table.

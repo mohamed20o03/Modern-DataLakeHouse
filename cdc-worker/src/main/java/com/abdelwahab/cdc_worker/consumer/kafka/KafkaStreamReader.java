@@ -9,37 +9,43 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Reads CDC events from a Kafka topic as a Spark Structured Streaming source.
+ * Reads CDC events from Kafka topics as a Spark Structured Streaming source.
+ *
+ * <p><b>Dynamic topic discovery:</b> Uses {@code subscribePattern("cdc\\..*")}
+ * to auto-discover new topics created by Debezium when new connectors are
+ * registered. New topics are picked up on the next micro-batch without
+ * restarting the streaming query.
  *
  * <p>The returned DataFrame has the standard Kafka source columns:<br>
  * {@code key, value, topic, partition, offset, timestamp, timestampType}
  *
  * <p>Downstream processing should cast {@code value} from binary to STRING
- * and then parse the Debezium JSON envelope.
+ * and then parse the Debezium JSON envelope. The {@code topic} column is
+ * used to group events by source table for per-table MERGE INTO.
  */
 public class KafkaStreamReader implements StreamReader {
 
     private static final Logger log = LoggerFactory.getLogger(KafkaStreamReader.class);
 
     private final String bootstrapServers;
-    private final String topic;
+    private final String topicPattern;
 
     public KafkaStreamReader(CdcConfig config) {
         this.bootstrapServers = config.getKafkaBootstrapServers();
-        // Derive topic from the first table in the include list
-        // e.g. "public.customers" → "cdc.public.customers"
-        String firstTable = config.getCdcTableIncludeList().split(",")[0].trim();
-        this.topic = config.getTopicForTable(firstTable);
+        // Use pattern subscription for dynamic multi-table support
+        // Matches all Debezium topics: cdc.public.customers, cdc.public.orders, etc.
+        this.topicPattern = config.getCdcTopicPrefix() + "\\..*";
     }
 
     @Override
     public Dataset<Row> read(SparkSession spark) {
-        log.info("Opening Kafka streaming source — servers={}, topic={}", bootstrapServers, topic);
+        log.info("Opening Kafka streaming source — servers={}, pattern={}",
+                bootstrapServers, topicPattern);
 
         return spark.readStream()
                 .format("kafka")
                 .option("kafka.bootstrap.servers", bootstrapServers)
-                .option("subscribe", topic)
+                .option("subscribePattern", topicPattern)
                 .option("startingOffsets", "earliest")
                 .option("failOnDataLoss", "false")
                 .load();

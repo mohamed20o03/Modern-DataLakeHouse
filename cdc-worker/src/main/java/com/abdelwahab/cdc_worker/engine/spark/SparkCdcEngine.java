@@ -2,9 +2,11 @@ package com.abdelwahab.cdc_worker.engine.spark;
 
 import com.abdelwahab.cdc_worker.config.CdcConfig;
 import com.abdelwahab.cdc_worker.consumer.kafka.KafkaStreamReader;
+import com.abdelwahab.cdc_worker.consumer.rabbitmq.CdcCommandConsumer;
 import com.abdelwahab.cdc_worker.engine.CdcEngine;
 import com.abdelwahab.cdc_worker.maintenance.CompactionService;
 import com.abdelwahab.cdc_worker.maintenance.SnapshotManager;
+import com.abdelwahab.cdc_worker.registry.ConnectionRegistry;
 import com.abdelwahab.cdc_worker.status.redis.AsyncRedisJobStatusService;
 import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
@@ -15,9 +17,10 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>Lifecycle:</b>
  * <ol>
- *   <li>{@link #init()} — creates SparkSession, runs warm-up query</li>
+ *   <li>{@link #init()} — creates SparkSession, runs warm-up query,
+ *       initialises ConnectionRegistry and CdcCommandConsumer</li>
  *   <li>{@link #start(String[])} — routes to streaming or maintenance mode based on CLI args</li>
- *   <li>{@link #stop()} — stops streaming query and closes SparkSession</li>
+ *   <li>{@link #stop()} — stops streaming query, consumers, and closes SparkSession</li>
  * </ol>
  *
  * <p>This class owns the SparkSession lifecycle. It delegates streaming to
@@ -32,6 +35,8 @@ public class SparkCdcEngine implements CdcEngine {
     private SparkSession spark;
     private CdcStreamProcessor streamProcessor;
     private AsyncRedisJobStatusService statusService;
+    private ConnectionRegistry connectionRegistry;
+    private CdcCommandConsumer cdcCommandConsumer;
 
     public SparkCdcEngine(CdcConfig config) {
         this.config = config;
@@ -58,6 +63,16 @@ public class SparkCdcEngine implements CdcEngine {
                 config.getRedisPassword()
         );
 
+        // ConnectionRegistry — load active connections from Redis on startup
+        this.connectionRegistry = new ConnectionRegistry(config);
+        connectionRegistry.loadFromRedis();
+        log.info("ConnectionRegistry initialised and loaded from Redis");
+
+        // CdcCommandConsumer — start RabbitMQ listener in background thread
+        this.cdcCommandConsumer = new CdcCommandConsumer(config, connectionRegistry);
+        cdcCommandConsumer.start();
+        log.info("CdcCommandConsumer started");
+
         log.info("Spark CDC engine initialised");
     }
 
@@ -77,6 +92,12 @@ public class SparkCdcEngine implements CdcEngine {
             if (streamProcessor != null) {
                 streamProcessor.stop();
             }
+            if (cdcCommandConsumer != null) {
+                cdcCommandConsumer.close();
+            }
+            if (connectionRegistry != null) {
+                connectionRegistry.close();
+            }
             if (statusService != null) {
                 statusService.close();
             }
@@ -95,7 +116,7 @@ public class SparkCdcEngine implements CdcEngine {
         statusService.writeStatus("cdc-worker", "STARTING", "Initialising streaming pipeline");
 
         var reader = new KafkaStreamReader(config);
-        var writer = new IcebergMergeWriter(config);
+        var writer = new IcebergMergeWriter(connectionRegistry);
 
         this.streamProcessor = new CdcStreamProcessor(config, spark, reader, writer, statusService);
         streamProcessor.start();

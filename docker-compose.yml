@@ -97,6 +97,8 @@ services:
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT}
       - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - CDC_ENCRYPTION_KEY=${CDC_ENCRYPTION_KEY}
+      - DEBEZIUM_CONNECT_URL=${DEBEZIUM_CONNECT_URL}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
       interval: 10s
@@ -382,10 +384,17 @@ services:
       # Compaction & Snapshot
       - COMPACTION_TARGET_FILE_SIZE_BYTES=${COMPACTION_TARGET_FILE_SIZE_BYTES}
       - SNAPSHOT_RETAIN_DAYS=${SNAPSHOT_RETAIN_DAYS}
+      # RabbitMQ Configuration (CDC connection commands)
+      - RABBITMQ_HOST=${RABBITMQ_HOST}
+      - RABBITMQ_PORT=${RABBITMQ_PORT}
+      - RABBITMQ_USERNAME=${RABBITMQ_DEFAULT_USER}
+      - RABBITMQ_PASSWORD=${RABBITMQ_DEFAULT_PASS}
     depends_on:
       kafka:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
       minio-setup:
         condition: service_completed_successfully
