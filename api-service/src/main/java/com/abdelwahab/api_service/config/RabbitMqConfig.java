@@ -44,15 +44,18 @@ public class RabbitMqConfig {
     // Exchange names - used by MessagePublisherService
     public static final String INGESTION_EXCHANGE = "ingestion.exchange";
     public static final String QUERY_EXCHANGE = "query.exchange";
+    public static final String CDC_EXCHANGE = "cdc.exchange";
     
     // Queue names - consumed by worker applications
     public static final String INGESTION_QUEUE = "ingestion.queue";
     public static final String QUERY_QUEUE = "query.queue";
+    public static final String CDC_QUEUE = "cdc.connections.queue";
     // Note: schema jobs are routed through query.queue (SparkService dispatches on 'schema-' jobId prefix)
     
     // Routing keys - bind exchanges to queues
     public static final String INGESTION_ROUTING_KEY = "ingestion.upload";
     public static final String QUERY_ROUTING_KEY = "query.execute";
+    public static final String CDC_ROUTING_KEY = "cdc.connection";
     
     // ==================== Exchanges ====================
     
@@ -82,6 +85,20 @@ public class RabbitMqConfig {
     @Bean
     public TopicExchange queryExchange() {
         return new TopicExchange(QUERY_EXCHANGE);
+    }
+
+    /**
+     * Creates the CDC topic exchange.
+     * <p>
+     * Messages published to this exchange with routing key "cdc.connection"
+     * will be routed to the CDC connections queue.
+     * </p>
+     *
+     * @return TopicExchange for CDC workflow
+     */
+    @Bean
+    public TopicExchange cdcExchange() {
+        return new TopicExchange(CDC_EXCHANGE);
     }
     
     // ==================== Queues ====================
@@ -124,6 +141,21 @@ public class RabbitMqConfig {
                 .withArgument("x-max-priority", 10)  // 0 = lowest, 10 = highest
                 .build();
     }
+
+    /**
+     * Creates the CDC connections queue (durable) with priority support.
+     *
+     * <p>CDC connection messages (CREATE/DELETE) are delivered to the cdc-worker.
+     * Priority 10 allows urgent operations to be processed first.
+     *
+     * @return durable, priority-enabled Queue for CDC connection messages
+     */
+    @Bean
+    public Queue cdcQueue() {
+        return QueueBuilder.durable(CDC_QUEUE)
+                .withArgument("x-max-priority", 10)
+                .build();
+    }
     
     // ==================== Bindings ====================
     
@@ -156,6 +188,20 @@ public class RabbitMqConfig {
         return BindingBuilder.bind(queryQueue)
             .to(queryExchange)
             .with(QUERY_ROUTING_KEY);
+    }
+
+    /**
+     * Binds CDC queue to CDC exchange.
+     *
+     * @param cdcQueue    the target queue
+     * @param cdcExchange the source exchange
+     * @return Binding configuration
+     */
+    @Bean
+    public Binding cdcBinding(Queue cdcQueue, TopicExchange cdcExchange) {
+        return BindingBuilder.bind(cdcQueue)
+            .to(cdcExchange)
+            .with(CDC_ROUTING_KEY);
     }
     
     // ==================== Message Converter ====================

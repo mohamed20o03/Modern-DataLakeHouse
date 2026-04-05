@@ -50,3 +50,5 @@ build/
 query-worker/target/
 ingestion-worker/target/
 api-service/target/
+cdc-worker/target/
+.specify/

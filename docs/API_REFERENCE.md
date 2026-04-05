@@ -33,17 +33,23 @@
    - [Get Schema](#get-apiv1schemasource)
    - [Check Schema Status](#get-apiv1schemastatusjobid)
    - [Wait for Schema](#get-apiv1schemastatusjobidwaittimeoutsec30)
-6. [How `/wait` Works](#6-how-wait-works)
-7. [How the SSE Stream Works](#7-how-the-sse-stream-works)
+6. [CDC Connections API](#6-cdc-connections-api)
+   - [Register Connection](#post-apiv1cdcconnections)
+   - [List Connections](#get-apiv1cdcconnections)
+   - [Check Connection Status](#get-apiv1cdcconnectionsid)
+   - [Wait for Connection](#get-apiv1cdcconnectionsidwaittimeoutsec60)
+   - [Delete Connection](#delete-apiv1cdcconnectionsid)
+7. [How `/wait` Works](#7-how-wait-works)
+8. [How the SSE Stream Works](#8-how-the-sse-stream-works)
    - [Event Sequence](#event-sequence)
    - [Event Payloads](#event-payloads)
    - [Small Results (Inline Fallback)](#small-results-inline-fallback)
-8. [Integration Patterns — Retrieving Query Results](#8-integration-patterns--retrieving-query-results)
+9. [Integration Patterns — Retrieving Query Results](#9-integration-patterns--retrieving-query-results)
    - [Pattern 1 — Use `/wait`, then check the `streamed` flag](#pattern-1--use-wait-then-check-the-streamed-flag)
    - [Pattern 2 — Always use the SSE stream (simplest)](#pattern-2--always-use-the-sse-stream-simplest)
    - [Pattern 3 — Poll (discouraged)](#pattern-3--poll-discouraged)
    - [Which pattern should I use?](#which-pattern-should-i-use)
-9. [Endpoint Summary](#endpoint-summary)
+10. [Endpoint Summary](#endpoint-summary)
 
 ---
 
@@ -497,7 +503,91 @@ Long-poll — same behaviour as the other `/wait` endpoints. Usually resolves in
 
 ---
 
-## 6. How `/wait` Works
+## 6. CDC Connections API
+
+Register, query, and delete real-time CDC connection pipelines linking PostgreSQL sources directly to Iceberg.
+
+---
+
+### `POST /api/v1/cdc/connections`
+
+Registers a new CDC pipeline via Debezium and notifies the streaming workers.
+
+**Content-Type:** `application/json`
+
+**Request body:**
+```json
+{
+  "host": "source-postgres",
+  "port": 5432,
+  "database": "sourcedb",
+  "schema": "public",
+  "table": "customers",
+  "username": "debezium",
+  "password": "debezium"
+}
+```
+
+| Field      | Type   | Required | Description                                       |
+| ---------- | ------ | :------: | ------------------------------------------------- |
+| `host`     | string |    ✅    | The source database hostname                      |
+| `port`     | int    |    ✅    | Source database port (usually 5432)               |
+| `database` | string |    ✅    | The name of the database                          |
+| `schema`   | string |    ✅    | The schema containing the tracked table           |
+| `table`    | string |    ✅    | The target table (must have a Primary Key)        |
+| `username` | string |    ✅    | Credentials. Passwords are securely encrypted     |
+| `password` | string |    ✅    | using AES-256-GCM.                                |
+
+**Response** — `201 Created`:
+```json
+{
+  "connectionId": "7b84c103-5ec3...",
+  "status": "SNAPSHOTTING",
+  "sourceTable": "public.customers",
+  "targetTable": "iceberg.cdc_namespace.customers",
+  "checkStatusAt": "/api/v1/cdc/connections/7b84c103...",
+  "createdAt": "2026-04-05T05:27:17Z"
+}
+```
+
+---
+
+### `GET /api/v1/cdc/connections`
+
+Returns an array of all known connections and their sync statuses.
+
+---
+
+### `GET /api/v1/cdc/connections/{id}`
+
+Poll the status of a specific connection.
+
+**Response** — `200 OK`:
+```json
+{
+  "connectionId": "7b84c103-5ec3-462c-...\",
+  "status": "STREAMING",
+  "sourceHost": "source-postgres",
+  "connectorStatus": "RUNNING",
+  "updatedAt": "2026-04-05T05:27:17Z"
+}
+```
+
+---
+
+### `GET /api/v1/cdc/connections/{id}/wait?timeoutSec=60`
+
+Long-poll blocking until the CDC connection reaches `STREAMING` status. Defaults to 60s timeout. 
+
+---
+
+### `DELETE /api/v1/cdc/connections/{id}`
+
+Tears down the pipeline. Connects to Debezium to drop the connector, drops replication slots on PostgreSQL, stops Kafka streaming, and instructs the `cdc-worker` to stop listening to this topic. Returns `204 No Content`.
+
+---
+
+## 7. How `/wait` Works
 
 All three job types expose a `/wait` variant:
 

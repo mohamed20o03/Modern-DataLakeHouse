@@ -1,6 +1,6 @@
 # Performance Bottlenecks & Optimizations
 
-> **Status:** All 5 optimizations described in this document have been **implemented**. The sections below document the problems that were identified, the fixes that were applied, and where to find the code.
+> **Status:** All 5 optimizations described in this document have been **implemented**. Additionally, a **real-time CDC pipeline** has been added with its own performance characteristics (see [CDC Pipeline Performance](#cdc-pipeline-performance)).
 
 ## System Architecture
 
@@ -24,6 +24,19 @@ Spark Worker
   │  ⑥ write result → Redis + MinIO (Parquet)
   ▼
 Redis (job status + result data)
+
+─── CDC Pipeline (parallel, independent) ───
+
+Source PostgreSQL (wal_level=logical)
+  │  WAL stream
+  ▼
+Debezium Connect → Kafka (KRaft)
+  │  CDC events (cdc.public.customers)
+  ▼
+CDC Worker (Spark Structured Streaming)
+  │  MERGE INTO Iceberg table
+  ▼
+Iceberg (s3://warehouse/)
 ```
 
 ---
@@ -223,3 +236,53 @@ If `rowCount <= 1000`, the result JSON is embedded directly in the Redis status 
 | Inline results for small queries | ✅ Done | Medium |
 | RabbitMQ priority queue          | ✅ Done | Medium |
 | Redis Pub/Sub (replace polling)  | ✅ Done | Medium |
+
+---
+
+## CDC Pipeline Performance
+
+The real-time CDC pipeline introduces a parallel data path (PostgreSQL → Debezium → Kafka → Spark Structured Streaming → Iceberg).
+
+### CDC Latency
+
+| Metric | Value |
+|--------|-------|
+| Trigger interval | 30 seconds (configurable) |
+| Batch processing time (10 events) | ~3 seconds |
+| End-to-end latency (source → Iceberg) | < 35 seconds |
+| Operations supported | INSERT, UPDATE, DELETE |
+
+### Small File Problem & Compaction
+
+Each micro-batch creates a new Parquet file. Over time this degrades read performance.
+
+| Metric | Before compaction | After compaction |
+|--------|-------------------|------------------|
+| Data files | 7 | 1 |
+| File reduction | — | 85% |
+| Row count | 15 | 15 (unchanged) |
+| Read overhead | ~3s (7 file opens) | ~0.5s (1 file open) |
+
+**Compaction command:**
+```bash
+docker compose run --rm cdc-worker --compact iceberg.cdc_namespace.customers
+```
+
+### Snapshot Management
+
+| Operation | Command | Notes |
+|-----------|---------|-------|
+| Tag snapshot | `--tag <table> <tagName>` | Tagged snapshots survive expiration |
+| Expire old snapshots | `--expire-snapshots <table> [retainDays]` | Only untagged snapshots are removed |
+
+### Implementation
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| CDC Engine | `SparkCdcEngine.java` | Spark session + CLI routing |
+| Stream Processor | `CdcStreamProcessor.java` | Kafka → foreachBatch pipeline |
+| Event Parser | `DebeziumEventParser.java` | Schema-less JSON parsing |
+| Deduplicator | `EventDeduplicator.java` | Window function (latest per PK) |
+| Merge Writer | `IcebergMergeWriter.java` | MERGE INTO with upsert/delete |
+| Compaction | `CompactionService.java` | Bin-pack via RewriteDataFiles |
+| Snapshots | `SnapshotManager.java` | Tag + expire via Spark SQL |
